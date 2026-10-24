@@ -1,0 +1,48 @@
+# Defaults match the docker-compose stack in the ddd-demo repo (docker compose up -d).
+spring:
+  application:
+    name: sample-service
+
+  datasource:
+    # One PostgreSQL instance for everyone, but one schema per service:
+    # currentSchema puts this service's tables in "sample_service" only.
+    url: jdbc:postgresql://localhost:5432/${POSTGRES_DB:ddd_demo}?currentSchema=sample_service
+    username: ${POSTGRES_USER:postgres}
+    password: ${POSTGRES_PASSWORD:1q2w3e4r!@}
+
+  flyway:
+    schemas: sample_service
+    default-schema: sample_service
+
+  jpa:
+    hibernate:
+      ddl-auto: validate   # Flyway owns the schema; Hibernate only checks it matches the entities
+    open-in-view: false
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+
+server:
+  port: 8080   # kafka-ui uses 8090 on the host, so 8080 stays free
+
+sample:
+  topics:
+    reservation-events: sample.reservation-events
+    partitions: 3
+
+outbox:
+  relay:
+    enabled: true
+    interval-ms: 500
+    batch-size: 100

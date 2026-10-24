@@ -1,0 +1,102 @@
+asyncapi: 3.1.0
+info:
+  title: sample-service event API
+  version: 0.1.0
+  description: |
+    Events published by the sample service. Every bounded context documents the
+    events it publishes in a file like this one; consumers write their own DTOs
+    from it instead of importing the producer's classes.
+
+    Delivery is at least once. Consumers must handle duplicates (same eventId)
+    and late events (revision not newer than the last one they saw).
+
+servers:
+  local:
+    host: localhost:9092
+    protocol: kafka
+    description: docker-compose stack from the ddd-demo repository
+
+channels:
+  reservationEvents:
+    address: sample.reservation-events
+    description: |
+      All events of the Reservation aggregate. The message key is the
+      reservationId, so all events of one reservation are on one partition
+      and arrive in the order they happened.
+    messages:
+      ReservationConfirmed:
+        $ref: '#/components/messages/ReservationConfirmed'
+      ReservationPartySizeChanged:
+        $ref: '#/components/messages/ReservationPartySizeChanged'
+      ReservationCancelled:
+        $ref: '#/components/messages/ReservationCancelled'
+
+operations:
+  publishReservationEvents:
+    action: send
+    channel:
+      $ref: '#/channels/reservationEvents'
+
+components:
+  messages:
+    ReservationConfirmed:
+      summary: A guest's reservation was accepted.
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        type: object
+        required: [reservationId, guestName, partySize, reservedFor, revision, occurredAt]
+        properties:
+          reservationId: { type: string, format: uuid }
+          guestName: { type: string }
+          partySize: { type: integer, minimum: 1, maximum: 12 }
+          reservedFor: { type: string, format: date-time }
+          revision: { $ref: '#/components/schemas/Revision' }
+          occurredAt: { type: string, format: date-time }
+
+    ReservationPartySizeChanged:
+      summary: The number of guests of a confirmed reservation changed.
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        type: object
+        required: [reservationId, partySize, revision, occurredAt]
+        properties:
+          reservationId: { type: string, format: uuid }
+          partySize: { type: integer, minimum: 1, maximum: 12 }
+          revision: { $ref: '#/components/schemas/Revision' }
+          occurredAt: { type: string, format: date-time }
+
+    ReservationCancelled:
+      summary: A reservation was cancelled. No further events follow for it.
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        type: object
+        required: [reservationId, revision, occurredAt]
+        properties:
+          reservationId: { type: string, format: uuid }
+          reason: { type: string }
+          revision: { $ref: '#/components/schemas/Revision' }
+          occurredAt: { type: string, format: date-time }
+
+  schemas:
+    EventHeaders:
+      type: object
+      required: [eventId, eventType, aggregateType]
+      properties:
+        eventId:
+          type: string
+          format: uuid
+          description: Unique per event. Redeliveries carry the same eventId.
+        eventType:
+          type: string
+          description: Name of the message, e.g. ReservationConfirmed.
+        aggregateType:
+          type: string
+          example: Reservation
+
+    Revision:
+      type: integer
+      minimum: 1
+      description: 1 for the first event of a reservation, +1 for every later one.
