@@ -84,6 +84,16 @@ class ScheduledRelayTest {
             assertThat(view.getPartySize()).isEqualTo(6);
             assertThat(view.getLastRevision()).isEqualTo(3);
         });
+
+        // The demo page and its read-only endpoints show the same state.
+        HttpResponse<String> page = call("GET", "/", "");
+        assertThat(page.statusCode()).isEqualTo(200);
+        assertThat(page.body()).contains("Outbox demo");
+        assertThat(jsonMapper.readTree(call("GET", "/demo/reservations", "").body()).toString())
+                .contains(id.toString()).contains("CANCELLED");
+        String outbox = call("GET", "/demo/outbox", "").body();
+        assertThat(outbox).contains("ReservationConfirmed", "ReservationPartySizeChanged", "ReservationCancelled");
+        assertThat(call("GET", "/demo/view", "").body()).contains(id.toString()).contains("\"lastRevision\":3");
     }
 
     private HttpResponse<String> call(String method, String path, String json) throws Exception {

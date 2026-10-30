@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Outbox demo · sample service</title>
+<link rel="icon" href="data:,">
+<!--
+  DEMO ONLY. A click-through view of the sample service for the 06.11 workshop.
+  Uses the normal REST API to change reservations and the read-only /demo endpoints
+  to show the aggregate, the outbox and the consumer's view. No external resources,
+  so it works without internet.
+-->
+<style>
+  :root {
+    --bg: #f6f5f2; --card: #ffffff; --ink: #1d1d1b; --muted: #6b6a66; --line: #e3e1dc;
+    --accent: #2f5fd0; --accent-soft: #e8eefb;
+    --ok: #1f7a4d; --ok-soft: #e3f3ea; --wait: #9a5b00; --wait-soft: #fcefd9;
+    --bad: #b3261e; --bad-soft: #fbe6e4;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header { padding: 20px 28px 8px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 20px; }
+  h1 { font-size: 24px; margin: 0; }
+  .sub { color: var(--muted); }
+  .live { margin-left: auto; font-size: 14px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ok); }
+  .dot.off { background: var(--bad); }
+  .hint {
+    margin: 8px 28px 0; padding: 10px 14px; border-radius: 10px;
+    background: var(--accent-soft); color: #1f3d85; font-size: 15px;
+  }
+  main {
+    display: grid; gap: 18px; padding: 18px 28px 28px;
+    grid-template-columns: minmax(300px, 1.1fr) minmax(300px, 1fr) minmax(260px, 0.9fr);
+    align-items: start;
+  }
+  @media (max-width: 1100px) { main { grid-template-columns: minmax(0, 1fr); } }
+  @media (max-width: 700px) {
+    header { padding: 16px 16px 4px; } .hint { margin: 8px 16px 0; } main { padding: 14px 16px 20px; }
+    section { padding: 14px 12px; } td, th { padding-left: 4px; padding-right: 4px; }
+    .actions { flex-wrap: wrap; }
+  }
+  section { min-width: 0; }
+  .id { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--muted); margin-left: 6px; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; }
+  .step { font-size: 12px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--accent); }
+  h2 { font-size: 19px; margin: 2px 0 2px; }
+  .what { color: var(--muted); font-size: 14px; margin: 0 0 12px; }
+  form { display: grid; grid-template-columns: 1fr 80px; gap: 8px; margin-bottom: 14px; }
+  form .full { grid-column: 1 / -1; }
+  label { font-size: 13px; color: var(--muted); display: block; margin-bottom: 2px; }
+  input {
+    width: 100%; font: inherit; padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; background: #fff;
+  }
+  button {
+    font: inherit; font-weight: 600; border: 0; border-radius: 8px; padding: 8px 12px; cursor: pointer;
+    background: var(--accent); color: #fff;
+  }
+  button.ghost { background: #fff; color: var(--ink); border: 1px solid var(--line); font-weight: 500; padding: 5px 9px; }
+  button.danger { background: #fff; color: var(--bad); border: 1px solid #f0c9c5; font-weight: 500; padding: 5px 9px; }
+  button:disabled { opacity: .45; cursor: default; }
+  table { width: 100%; border-collapse: collapse; font-size: 15px; }
+  th { text-align: left; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+  td { padding: 7px 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  tr:last-child td { border-bottom: 0; }
+  .empty { color: var(--muted); font-size: 14px; padding: 10px 6px; }
+  .badge { display: inline-block; font-size: 12px; font-weight: 700; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+  .badge.sent { background: var(--ok-soft); color: var(--ok); }
+  .badge.waiting { background: var(--wait-soft); color: var(--wait); animation: pulse 1.2s ease-in-out infinite; }
+  .badge.confirmed { background: var(--ok-soft); color: var(--ok); }
+  .badge.cancelled { background: #eeedea; color: var(--muted); }
+  @keyframes pulse { 50% { opacity: .55; } }
+  .count { font-size: 13px; font-weight: 600; margin-left: 6px; }
+  .count.waiting { color: var(--wait); }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 13px; color: var(--muted); }
+  .actions { display: flex; gap: 6px; align-items: center; }
+  .actions input { width: 56px; padding: 4px 6px; }
+  .fresh { animation: flash 1.6s ease-out; }
+  @keyframes flash { from { background: #fff4c2; } to { background: transparent; } }
+  #toast {
+    position: fixed; right: 20px; bottom: 20px; max-width: 420px; padding: 12px 16px; border-radius: 10px;
+    background: var(--ink); color: #fff; font-size: 15px; box-shadow: 0 6px 24px rgba(0,0,0,.18);
+    opacity: 0; transform: translateY(8px); transition: .2s; pointer-events: none;
+  }
+  #toast.show { opacity: 1; transform: none; }
+  #toast.err { background: var(--bad); }
+  .flow { color: var(--muted); font-size: 13px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Outbox demo</h1>
+  <span class="sub">sample service · change, outbox, consumer</span>
+  <span class="live"><span class="dot" id="dot"></span><span id="liveText">live</span></span>
+</header>
+<div class="hint">
+  Try it: stop <b>kafka</b> in Docker Desktop, change a reservation, and watch the new event wait in the outbox.
+  Start Kafka again and it goes out by itself.
+</div>
+
+<main>
+  <section>
+    <div class="step">1 · Aggregate</div>
+    <h2>Reservations</h2>
+    <p class="what">The service changes the aggregate and writes the event to the outbox in the same transaction.</p>
+    <form id="create">
+      <div><label for="guest">Guest</label><input id="guest" value="Ada" required></div>
+      <div><label for="size">Party (1–12)</label><input id="size" type="number" value="4"></div>
+      <div class="full"><label for="when">Reserved for</label><input id="when" type="datetime-local" required></div>
+      <div class="full"><button type="submit">Create reservation</button></div>
+    </form>
+    <table>
+      <thead><tr><th>Guest</th><th>Party</th><th>Status</th><th>Rev</th><th></th></tr></thead>
+      <tbody id="reservations"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <div class="step">2 · Outbox → Kafka</div>
+    <h2>Outbox <span class="count" id="waitingCount"></span></h2>
+    <p class="what">The relay sends waiting rows to Kafka, keyed by reservation ID, and marks them as sent.</p>
+    <table>
+      <thead><tr><th>#</th><th>Event</th><th>Rev</th><th>Status</th></tr></thead>
+      <tbody id="outbox"></tbody>
+    </table>
+    <div class="flow">Messages also visible in Kafka UI: localhost:8090 → sample.reservation-events</div>
+  </section>
+
+  <section>
+    <div class="step">3 · Consumer</div>
+    <h2>Consumer's view</h2>
+    <p class="what">Built from events alone. Duplicates and late events are skipped.</p>
+    <table>
+      <thead><tr><th>Guest</th><th>Party</th><th>Status</th><th>Rev</th></tr></thead>
+      <tbody id="view"></tbody>
+    </table>
+  </section>
+</main>
+
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seen = { reservations: new Map(), outbox: new Map(), view: new Map() };
+  let toastTimer;
+
+  // Default time: tomorrow 19:00 local time.
+  const t = new Date(); t.setDate(t.getDate() + 1); t.setHours(19, 0, 0, 0);
+  const pad = n => String(n).padStart(2, '0');
+  $('when').value = `${t.getFullYear()}-${pad(t.getMonth() + 1)}-${pad(t.getDate())}T19:00`;
+
+  function toast(text, isError) {
+    const el = $('toast');
+    el.textContent = text;
+    el.className = 'show' + (isError ? ' err' : '');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.className = ''; }, 3500);
+  }
+
+  async function call(method, url, body) {
+    const res = await fetch(url, {
+      method, headers: { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body)
+    });
+    if (!res.ok) {
+      let detail = res.statusText;
+      try { detail = (await res.json()).detail || detail; } catch (e) { /* no JSON body */ }
+      throw new Error(`${res.status}: ${detail}`);
+    }
+    return res.status === 204 ? null : res.json();
+  }
+
+  function cell(text, className) {
+    const td = document.createElement('td');
+    if (className) td.className = className;
+    if (text instanceof Node) td.appendChild(text); else td.textContent = text;
+    return td;
+  }
+
+  function badge(text, kind) {
+    const b = document.createElement('span');
+    b.className = 'badge ' + kind;
+    b.textContent = text;
+    return b;
+  }
+
+  // Re-render a table body; rows whose content changed since the last poll flash once.
+  function render(tbodyId, rows, key, signature, build, emptyText) {
+    const tbody = $(tbodyId);
+    const before = seen[tbodyId];
+    const after = new Map();
+    tbody.replaceChildren();
+    if (rows.length === 0) {
+      const tr = document.createElement('tr');
+      const td = cell(emptyText, 'empty'); td.colSpan = 5;
+      tr.appendChild(td); tbody.appendChild(tr);
+    }
+    rows.forEach(r => {
+      const tr = build(r);
+      const sig = signature(r);
+      if (before.size > 0 && before.get(key(r)) !== sig) tr.classList.add('fresh');
+      after.set(key(r), sig);
+      tbody.appendChild(tr);
+    });
+    seen[tbodyId] = after;
+  }
+
+  // Guest name plus the first characters of the reservation ID, to match rows across panels.
+  function guest(name, id) {
+    const span = document.createElement('span');
+    const tag = document.createElement('span');
+    tag.className = 'id'; tag.textContent = '#' + String(id).slice(0, 4);
+    span.append(document.createTextNode(name), tag);
+    return span;
+  }
+
+  function reservationRow(r) {
+    const tr = document.createElement('tr');
+    tr.append(cell(guest(r.guestName, r.id)), cell(String(r.partySize)),
+      cell(badge(r.status.toLowerCase(), r.status.toLowerCase())), cell(String(r.revision)));
+    const actions = document.createElement('div'); actions.className = 'actions';
+    const size = document.createElement('input'); size.type = 'number'; size.value = r.partySize;
+    size.setAttribute('aria-label', 'New party size for ' + r.guestName);
+    const change = document.createElement('button'); change.className = 'ghost'; change.textContent = 'Change';
+    const cancel = document.createElement('button'); cancel.className = 'danger'; cancel.textContent = 'Cancel';
+    change.onclick = () => act(() => call('PUT', `/reservations/${r.id}/party-size`, { partySize: Number(size.value) }),
+      `Party size changed to ${size.value}`);
+    cancel.onclick = () => act(() => call('POST', `/reservations/${r.id}/cancellation`, { reason: 'demo' }),
+      'Reservation cancelled');
+    actions.append(size, change, cancel);
+    tr.appendChild(cell(actions));
+    return tr;
+  }
+
+  function outboxRow(o) {
+    const tr = document.createElement('tr');
+    const sent = o.publishedAt !== null;
+    tr.append(cell(String(o.id), 'mono'), cell(eventCell(o)),
+      cell(o.revision ?? ''), cell(badge(sent ? 'sent' : 'waiting', sent ? 'sent' : 'waiting')));
+    tr.title = `Kafka key ${o.aggregateId}`;
+    return tr;
+  }
+
+  function eventCell(o) {
+    const span = document.createElement('span');
+    const tag = document.createElement('span');
+    tag.className = 'id'; tag.textContent = '#' + String(o.aggregateId).slice(0, 4);
+    span.append(document.createTextNode(o.eventType.replace('Reservation', '')), tag);
+    return span;
+  }
+
+  function viewRow(v) {
+    const tr = document.createElement('tr');
+    const status = (v.status || '').toLowerCase();
+    tr.append(cell(guest(v.guestName ?? '–', v.id)), cell(v.partySize == null ? '–' : String(v.partySize)),
+      cell(badge(status, status)), cell(String(v.lastRevision)));
+    return tr;
+  }
+
+  async function act(fn, okText) {
+    try { await fn(); toast(okText, false); refresh(); }
+    catch (e) { toast(e.message, true); }
+  }
+
+  $('create').addEventListener('submit', ev => {
+    ev.preventDefault();
+    const when = new Date($('when').value);
+    act(() => call('POST', '/reservations', {
+      guestName: $('guest').value, partySize: Number($('size').value), reservedFor: when.toISOString()
+    }), `Reservation for ${$('guest').value} created`);
+  });
+
+  let busy = false;
+  async function refresh() {
+    if (busy) return;
+    busy = true;
+    try {
+      const [reservations, outbox, view] = await Promise.all(
+        ['/demo/reservations', '/demo/outbox', '/demo/view'].map(u => fetch(u).then(r => {
+          if (!r.ok) throw new Error(r.status);
+          return r.json();
+        })));
+      render('reservations', reservations, r => r.id, r => `${r.partySize}|${r.status}|${r.revision}`,
+        reservationRow, 'No reservations yet. Create one above.');
+      render('outbox', outbox, o => o.id, o => String(o.publishedAt !== null), outboxRow, 'No events yet.');
+      render('view', view, v => v.id, v => `${v.partySize}|${v.status}|${v.lastRevision}`, viewRow,
+        'Nothing received yet.');
+      const waiting = outbox.filter(o => o.publishedAt === null).length;
+      const wc = $('waitingCount');
+      wc.textContent = waiting ? `${waiting} waiting` : '';
+      wc.className = 'count' + (waiting ? ' waiting' : '');
+      $('dot').className = 'dot'; $('liveText').textContent = 'live';
+    } catch (e) {
+      $('dot').className = 'dot off'; $('liveText').textContent = 'service not reachable';
+    } finally {
+      busy = false;
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 1000);
+})();
+</script>
+</body>
+</html>

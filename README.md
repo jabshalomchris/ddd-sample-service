@@ -1,6 +1,6 @@
 # Sample service: outbox, Kafka and idempotent consumers
 
-> **Draft 1, 22.10.2026.** Architecture team, workstream 2 (helper libraries: usage guide, sample service, outbox).
+> **Draft 2, 30.10.2026.** Architecture team, workstream 2 (helper libraries: usage guide, sample service, outbox).
 > Lead: Judah. Newcomer read: Dongxin. ADR on outbox and library use: Eldar.
 
 This is a reference for every bounded context team. It shows, in a small running service, how to publish domain events reliably and how to consume them safely on our stack (Kafka and PostgreSQL from the `ddd-demo` docker-compose).
@@ -19,10 +19,26 @@ You need Java 21 and Docker.
 docker compose up -d          # Kafka on localhost:9092, Kafka UI on localhost:8090, PostgreSQL on localhost:5432
 
 # in this repository
-./mvnw spring-boot:run        # service on localhost:8080
+./mvnw spring-boot:run        # service on localhost:8080 (Windows: .\mvnw.cmd spring-boot:run)
 ```
 
-Create, change and cancel a reservation:
+### The demo page
+
+Open **http://localhost:8080**. One page shows the whole path of an event, in three panels:
+
+1. **Reservations** (the aggregate): create, change and cancel reservations with buttons.
+2. **Outbox**: every event the service wrote, marked *waiting* until the relay has sent it to Kafka, then *sent*.
+3. **Consumer's view**: what a neighbouring context built from the events alone.
+
+The short ID next to each name (for example `#7b09`) is the start of the reservation ID, so you can follow one reservation across all three panels. Cancelling twice or entering a party of 13 shows the error the API returns (409 and 400).
+
+To see the outbox at work, stop the `kafka` container in Docker Desktop, change a reservation, and watch the new event stay *waiting*. Start Kafka again and it changes to *sent* by itself.
+
+The page (`src/main/resources/static/index.html`) and its read-only `/demo/*` endpoints (`demo` package) exist only for showing the service. A real service would not expose its outbox like this; do not copy them.
+
+**Without Docker:** `./mvnw test -Dtest=DemoPageRunner -Ddemo.run=true` starts the service with an embedded PostgreSQL and an in-process Kafka on port 8080 for 30 minutes. The relay runs every 4 seconds there, so you can see events wait briefly. Stopping Kafka is not possible in this mode.
+
+### Or from the command line
 
 ```bash
 ID=$(curl -s -X POST localhost:8080/reservations -H 'Content-Type: application/json' \
@@ -102,6 +118,7 @@ So every consumer must cope with **duplicates**, and should cope with **late or 
 | `reservationview/application/ReservationEventListener.java` | Pattern for every listener: guard, revision check, own DTOs |
 | `application.yaml` | Change schema, topic names and consumer group |
 | `docs/asyncapi.yaml` | Template for your own event API |
+| `demo/*`, `static/index.html`, `DemoPageRunner` | Do not copy. Demo only; for your own dummy client, build on your service's real API |
 
 The packages follow the course's DDD package convention (one top-level package per aggregate, with `domain` and `application`). Before copying, check this against the starter platform the tactical team hands out on 06.11.; where they differ, theirs wins.
 
@@ -119,7 +136,7 @@ The packages follow the course's DDD package convention (one top-level package p
 | `lateEventDoesNotOverwriteNewerState` | revision 1 after revision 2 is ignored |
 | `poisonMessageGoesToTheDeadLetterTopicAndDoesNotBlockThePartition` | broken message ends in `.DLT`, the next one is processed |
 
-`ScheduledRelayTest` runs the walkthrough from section 1 over real HTTP with the scheduler switched on, including the 409 for cancelling twice and the 400 for a party of 13.
+`ScheduledRelayTest` runs the walkthrough from section 1 over real HTTP with the scheduler switched on, including the 409 for cancelling twice and the 400 for a party of 13, and checks that the demo page and its `/demo/*` endpoints show the same state.
 
 `ReservationTest` covers the aggregate's own invariants.
 
