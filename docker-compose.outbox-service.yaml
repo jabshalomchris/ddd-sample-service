@@ -1,0 +1,43 @@
+# Outbox-Service for the sample service, next to the ddd-demo stack.
+#
+#   1. in ddd-demo:              docker compose up -d
+#   2. in this repository:       docker compose -f docker-compose.outbox-service.yaml up -d
+#   3. start the sample service WITHOUT the local-relay profile
+#
+# The Outbox-Service reads this service's event_outbox table, sends the events to Kafka and
+# deletes them once Kafka has confirmed them. One instance per producing service: each one points
+# at that service's schema and lists that service's topics. Each partition must have exactly one
+# reader, so never run it together with the sample's local relay.
+#
+# TO CONFIRM with Daniel Köllgen: image name/tag and whether the registry is public.
+# The configuration below was tested with the Outbox-Service 4.1.0 jar (not with the image).
+
+services:
+  sample-outbox-service:
+    image: registry.gitlab.com/microservice-dungeon/services/outbox-service:4.1.0
+    environment:
+      # The JDBC URL is set directly, so the schema can be chosen (one schema per service).
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-ddd_demo}?currentSchema=sample_service&reWriteBatchedInserts=true
+      # Still required by the service's own configuration placeholders:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_TABLE: ${POSTGRES_DB:-ddd_demo}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASS: ${POSTGRES_PASSWORD:-1q2w3e4r!@}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092       # ddd-demo's listener for containers
+      APP_SCHEDULER_INTERVAL: "500"              # polling interval in ms
+      # Topics and partitions this instance reads (must match the topic's partition count):
+      APP_OUTBOX_TOPICS_0_NAME: bl.reservation.events.v1
+      APP_OUTBOX_TOPICS_0_PARTITIONS_0: "0"
+      APP_OUTBOX_TOPICS_0_PARTITIONS_1: "1"
+      APP_OUTBOX_TOPICS_0_PARTITIONS_2: "2"
+    ports:
+      - "127.0.0.1:8081:8080"                    # health: http://localhost:8081/actuator/health
+    restart: unless-stopped
+    networks:
+      - ddd-demo
+
+networks:
+  ddd-demo:
+    external: true
+    name: ddd-demo_default                       # the network docker compose created for ddd-demo

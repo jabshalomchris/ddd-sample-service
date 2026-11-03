@@ -24,6 +24,11 @@ public class MessagingConfig {
     /**
      * Created on startup if missing. Three partitions on purpose: with one partition,
      * ordering bugs (missing message keys) never show up locally.
+     *
+     * <p>The outbox library checks at startup that every topic in {@code outbox.topics} exists
+     * and reads its partition count, so the topic must exist before the first event is written.
+     * Here Spring's KafkaAdmin creates it while the context starts, which is early enough.
+     * In the shared stack, topics may instead be created centrally (open question for the ADR).
      */
     @Bean
     NewTopic reservationEventsTopic(@Value("${sample.topics.reservation-events}") String name,
@@ -36,7 +41,7 @@ public class MessagingConfig {
      * record goes to "&lt;topic&gt;.DLT" so it does not block the partition forever.
      */
     @Bean
-    DefaultErrorHandler kafkaErrorHandler(KafkaTemplate<String, String> kafkaTemplate) {
+    DefaultErrorHandler kafkaErrorHandler(KafkaTemplate<String, byte[]> kafkaTemplate) {
         var recoverer = new DeadLetterPublishingRecoverer(kafkaTemplate,
                 (record, exception) -> new TopicPartition(record.topic() + ".DLT", -1));
         return new DefaultErrorHandler(recoverer, new FixedBackOff(1000L, 2));

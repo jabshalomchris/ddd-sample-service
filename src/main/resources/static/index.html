@@ -89,6 +89,7 @@
   #toast.show { opacity: 1; transform: none; }
   #toast.err { background: var(--bad); }
   .flow { color: var(--muted); font-size: 13px; margin-top: 10px; }
+  h2.second { margin-top: 18px; }
 </style>
 </head>
 <body>
@@ -98,8 +99,8 @@
   <span class="live"><span class="dot" id="dot"></span><span id="liveText">live</span></span>
 </header>
 <div class="hint">
-  Try it: stop <b>kafka</b> in Docker Desktop, change a reservation, and watch the new event wait in the outbox.
-  Start Kafka again and it goes out by itself.
+  Try it: stop the <b>outbox-service</b> (or <b>kafka</b>) in Docker Desktop, change a reservation, and watch the
+  new event wait in the outbox. Start it again and the event goes out by itself.
 </div>
 
 <main>
@@ -122,18 +123,24 @@
   <section>
     <div class="step">2 · Outbox → Kafka</div>
     <h2>Outbox <span class="count" id="waitingCount"></span></h2>
-    <p class="what">The relay sends waiting rows to Kafka, keyed by reservation ID, and marks them as sent.</p>
+    <p class="what">Events waiting to be sent. The Outbox-Service sends them to Kafka, keyed by reservation ID, and deletes each row once Kafka has confirmed it.</p>
     <table>
-      <thead><tr><th>#</th><th>Event</th><th>Rev</th><th>Status</th></tr></thead>
+      <thead><tr><th>Seq</th><th>Event</th><th>Part.</th><th>Status</th></tr></thead>
       <tbody id="outbox"></tbody>
     </table>
-    <div class="flow">Messages also visible in Kafka UI: localhost:8090 → sample.reservation-events</div>
+    <div class="flow">Sent messages: Kafka UI, localhost:8090 → bl.reservation.events.v1</div>
   </section>
 
   <section>
     <div class="step">3 · Consumer</div>
-    <h2>Consumer's view</h2>
-    <p class="what">Built from events alone. Duplicates and late events are skipped.</p>
+    <h2>Received events</h2>
+    <p class="what">What the consumer processed, by sequence id. Duplicates are skipped by event id.</p>
+    <table>
+      <thead><tr><th>Seq</th><th>Event</th></tr></thead>
+      <tbody id="delivered"></tbody>
+    </table>
+    <h2 class="second">Consumer's view</h2>
+    <p class="what">Built from events alone. Late events are skipped by revision.</p>
     <table>
       <thead><tr><th>Guest</th><th>Party</th><th>Status</th><th>Rev</th></tr></thead>
       <tbody id="view"></tbody>
@@ -146,7 +153,7 @@
 <script>
 (() => {
   const $ = id => document.getElementById(id);
-  const seen = { reservations: new Map(), outbox: new Map(), view: new Map() };
+  const seen = { reservations: new Map(), outbox: new Map(), delivered: new Map(), view: new Map() };
   let toastTimer;
 
   // Default time: tomorrow 19:00 local time.
@@ -239,18 +246,25 @@
 
   function outboxRow(o) {
     const tr = document.createElement('tr');
-    const sent = o.publishedAt !== null;
-    tr.append(cell(String(o.id), 'mono'), cell(eventCell(o)),
-      cell(o.revision ?? ''), cell(badge(sent ? 'sent' : 'waiting', sent ? 'sent' : 'waiting')));
+    tr.append(cell(String(o.sequenceId), 'mono'), cell(eventCell(o)),
+      cell(String(o.partition), 'mono'), cell(badge('waiting', 'waiting')));
     tr.title = `Kafka key ${o.aggregateId}`;
     return tr;
   }
 
+  function deliveredRow(d) {
+    const tr = document.createElement('tr');
+    tr.append(cell(String(d.sequenceId ?? ''), 'mono'), cell(eventCell(d)));
+    tr.title = `Kafka key ${d.aggregateId}`;
+    return tr;
+  }
+
+  // "reservation.party-size-changed" -> "party-size-changed", plus the short reservation id
   function eventCell(o) {
     const span = document.createElement('span');
     const tag = document.createElement('span');
-    tag.className = 'id'; tag.textContent = '#' + String(o.aggregateId).slice(0, 4);
-    span.append(document.createTextNode(o.eventType.replace('Reservation', '')), tag);
+    tag.className = 'id'; tag.textContent = '#' + String(o.aggregateId ?? '').slice(0, 4);
+    span.append(document.createTextNode(String(o.eventType ?? '').replace(/^reservation\./, '')), tag);
     return span;
   }
 
@@ -280,17 +294,20 @@
     if (busy) return;
     busy = true;
     try {
-      const [reservations, outbox, view] = await Promise.all(
-        ['/demo/reservations', '/demo/outbox', '/demo/view'].map(u => fetch(u).then(r => {
+      const [reservations, outbox, delivered, view] = await Promise.all(
+        ['/demo/reservations', '/demo/outbox', '/demo/delivered', '/demo/view'].map(u => fetch(u).then(r => {
           if (!r.ok) throw new Error(r.status);
           return r.json();
         })));
       render('reservations', reservations, r => r.id, r => `${r.partySize}|${r.status}|${r.revision}`,
         reservationRow, 'No reservations yet. Create one above.');
-      render('outbox', outbox, o => o.id, o => String(o.publishedAt !== null), outboxRow, 'No events yet.');
+      render('outbox', outbox, o => o.sequenceId, () => 'waiting', outboxRow,
+        'Empty: every event has been sent to Kafka.');
+      render('delivered', delivered, d => d.sequenceId + '|' + d.aggregateId, () => 'in', deliveredRow,
+        'Nothing received yet.');
       render('view', view, v => v.id, v => `${v.partySize}|${v.status}|${v.lastRevision}`, viewRow,
         'Nothing received yet.');
-      const waiting = outbox.filter(o => o.publishedAt === null).length;
+      const waiting = outbox.length;
       const wc = $('waitingCount');
       wc.textContent = waiting ? `${waiting} waiting` : '';
       wc.className = 'count' + (waiting ? ' waiting' : '');

@@ -1,7 +1,16 @@
 package de.thkoeln.ddd.sample;
 
-import de.thkoeln.ddd.sample.outbox.OutboxRelay;
-import de.thkoeln.ddd.sample.outbox.OutboxWriter;
+import de.microservicedungeon.outboxlib.kafka.KafkaRecordMapper;
+import de.microservicedungeon.outboxlib.outbox.EntityIdentifier;
+import de.microservicedungeon.outboxlib.outbox.EventId;
+import de.microservicedungeon.outboxlib.outbox.EventKey;
+import de.microservicedungeon.outboxlib.outbox.EventType;
+import de.microservicedungeon.outboxlib.outbox.OutboxEventDto;
+import de.microservicedungeon.outboxlib.outbox.Partition;
+import de.microservicedungeon.outboxlib.outbox.ReadOutbox;
+import de.microservicedungeon.outboxlib.outbox.TopicName;
+import de.microservicedungeon.outboxlib.outbox.WriteOutbox;
+import de.thkoeln.ddd.sample.localrelay.LocalOutboxRelay;
 import de.thkoeln.ddd.sample.reservation.application.ReservationService;
 import de.thkoeln.ddd.sample.reservation.domain.ReservationId;
 import de.thkoeln.ddd.sample.reservationview.domain.ReservationView;
@@ -11,6 +20,7 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -32,21 +42,29 @@ import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZonedDateTime;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.util.stream.IntStream;
+import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Runs against a real PostgreSQL 18 (embedded binaries) and an in-process Kafka broker,
- * so no Docker is needed. The scheduler is off; tests call the relay themselves.
+ * Runs against a real PostgreSQL 18 (embedded binaries), an in-process Kafka broker and the
+ * supervisors' outbox and consumer libraries. The local relay stands in for the Outbox-Service;
+ * its schedule is effectively off (1 h), so each test triggers publishing itself.
  */
 @SpringBootTest(properties = {
-        "outbox.relay.enabled=false",
+        "sample.local-relay.enabled=true",
+        "sample.local-relay.interval-ms=3600000",
         "spring.kafka.bootstrap-servers=${spring.embedded.kafka.brokers}"
 })
 @EmbeddedKafka
@@ -65,16 +83,18 @@ class MessagingIntegrationTest {
     }
 
     @Autowired ReservationService reservationService;
-    @Autowired OutboxWriter outboxWriter;
-    @Autowired OutboxRelay outboxRelay;
+    @Autowired WriteOutbox writeOutbox;
+    @Autowired ReadOutbox readOutbox;
+    @Autowired KafkaRecordMapper recordMapper;
+    @Autowired LocalOutboxRelay relay;
     @Autowired ReservationViewRepository viewRepository;
     @Autowired JdbcTemplate jdbc;
     @Autowired TransactionTemplate transactionTemplate;
-    @Autowired KafkaTemplate<String, String> kafkaTemplate;
+    @Autowired KafkaTemplate<String, byte[]> kafkaTemplate;
     @Value("${sample.topics.reservation-events}") String topic;
     @Value("${spring.embedded.kafka.brokers}") String brokers;
 
-    // --- producer side: outbox -------------------------------------------------------
+    // --- producer side: what the outbox library writes ----------------------------------------
 
     @Test
     void savingTheAggregateAlsoWritesTheEventToTheOutbox() {
@@ -82,11 +102,16 @@ class MessagingIntegrationTest {
 
         assertThat(count("select count(*) from reservation where reservation_id = ?", id.getId())).isOne();
         Map<String, Object> row = jdbc.queryForMap("""
-                select event_type, payload->>'guestName' as guest, published_at
-                from outbox_message where aggregate_id = ?""", id.toString());
-        assertThat(row.get("event_type")).isEqualTo("ReservationConfirmed");
+                select topic_name, partition, event_key, event_type, event_type_version, entity_name,
+                       convert_from(payload, 'UTF8')::json->>'guestName' as guest
+                from event_outbox where entity_id = ?""", id.toString());
+        assertThat(row.get("topic_name")).isEqualTo(topic);
+        assertThat(row.get("event_key")).as("key = aggregate id").isEqualTo(id.toString());
+        assertThat(row.get("event_type")).isEqualTo("reservation.confirmed");
+        assertThat(((Number) row.get("event_type_version")).intValue()).isEqualTo(1);
+        assertThat(row.get("entity_name")).isEqualTo("reservation");
+        assertThat(((Number) row.get("partition")).intValue()).isBetween(0, 2);
         assertThat(row.get("guest")).isEqualTo("Ada");
-        assertThat(row.get("published_at")).as("not sent yet").isNull();
     }
 
     @Test
@@ -99,110 +124,167 @@ class MessagingIntegrationTest {
         })).isInstanceOf(IllegalStateException.class);
 
         assertThat(count("select count(*) from reservation where reservation_id = ?", id.get().getId())).isZero();
-        assertThat(count("select count(*) from outbox_message where aggregate_id = ?", id.get().toString())).isZero();
+        assertThat(count("select count(*) from event_outbox where entity_id = ?", id.get().toString())).isZero();
     }
 
     @Test
     void outboxCannotBeWrittenOutsideATransaction() {
-        assertThatThrownBy(() -> outboxWriter.append(topic, "Reservation", "x", "Test", Map.of()))
+        assertThatThrownBy(() -> writeOutbox.write(new TestOutboxEvent(topic, "x", "test.event", "{}")))
                 .isInstanceOf(IllegalTransactionStateException.class);
     }
 
-    // --- end to end: relay -> Kafka -> consumer --------------------------------------
-
     @Test
-    void relayPublishesInOrderAndTheConsumerFollows() {
+    void eventsOfOneReservationShareAPartitionAndKeepTheirOrder() {
         ReservationId id = reservationService.confirm("Ada", 4, EVENING);
         reservationService.changePartySize(id, 6);
         reservationService.cancel(id, "ill");
 
-        while (outboxRelay.publishPendingBatch() > 0) {
-            // drain everything that is pending, including rows from other tests
-        }
+        List<Map<String, Object>> rows = jdbc.queryForList(
+                "select partition, event_type from event_outbox where entity_id = ? order by sequence_id",
+                id.toString());
+        assertThat(rows).extracting(r -> r.get("event_type"))
+                .containsExactly("reservation.confirmed", "reservation.party-size-changed", "reservation.cancelled");
+        assertThat(rows).extracting(r -> r.get("partition")).containsOnly(rows.getFirst().get("partition"));
+    }
 
-        awaitTrue(() -> viewRepository.findById(id.getId())
-                .map(v -> v.getLastRevision() == 3).orElse(false));
+    // --- end to end: outbox -> relay -> Kafka -> consumer ---------------------------------------
+
+    @Test
+    void relayPublishesAndTheConsumerFollows() {
+        ReservationId id = reservationService.confirm("Ada", 4, EVENING);
+        reservationService.changePartySize(id, 6);
+        reservationService.cancel(id, "ill");
+
+        assertThat(relay.publishPending()).isGreaterThanOrEqualTo(3);
+
+        awaitTrue(() -> viewRepository.findById(id.getId()).map(v -> v.getLastRevision() == 3).orElse(false));
         ReservationView view = viewRepository.findById(id.getId()).orElseThrow();
         assertThat(view.getStatus()).isEqualTo(ReservationView.Status.CANCELLED);
         assertThat(view.getPartySize()).isEqualTo(6);
-        assertThat(view.getGuestName()).isEqualTo("Ada");
-        assertThat(count("select count(*) from outbox_message where aggregate_id = ? and published_at is null",
-                id.toString())).isZero();
+        assertThat(count("select count(*) from event_outbox where entity_id = ?", id.toString()))
+                .as("acknowledged rows are deleted").isZero();
+        assertThat(jdbc.queryForList("select sequence_id from processed_event where event_key = ? order by processed_at",
+                Long.class, id.toString()))
+                .as("received in the order they were written").isSorted().hasSize(3);
     }
 
-    // --- consumer side: what at-least-once delivery throws at you -----------------------
-
     @Test
-    void duplicateDeliveryIsHandledOnce(CapturedOutput output) {
-        UUID reservationId = UUID.randomUUID();
-        UUID confirmedId = UUID.randomUUID();
-        String confirmed = confirmedJson(reservationId, "Ada", 4, 1);
+    void publishedRecordsCarryTheStandardHeaders() {
+        ReservationId id = reservationService.confirm("Ada", 4, EVENING);
+        relay.publishPending();
 
-        send(reservationId, confirmedId, "ReservationConfirmed", confirmed);
-        send(reservationId, confirmedId, "ReservationConfirmed", confirmed); // same event ID again
-        UUID marker = send(reservationId, UUID.randomUUID(), "ReservationPartySizeChanged",
-                partySizeChangedJson(reservationId, 5, 2));
+        var record = recordsOn(topic).stream().filter(r -> id.toString().equals(r.key())).findFirst().orElseThrow();
+        assertThat(header(record, "event_type")).isEqualTo("reservation.confirmed");
+        assertThat(record.headers().lastHeader("event_id")).isNotNull();
+        assertThat(record.headers().lastHeader("sequence_id")).isNotNull();
+        assertThat(record.headers().lastHeader("event_type_version").value()).hasSize(4);
+        assertThat(header(record, "entity")).isEqualTo("reservation." + id);
+    }
 
-        awaitProcessed(marker);
-        assertThat(output.getOut()).containsOnlyOnce("Skipping duplicate ReservationConfirmed " + confirmedId);
-        assertThat(viewRepository.findById(reservationId).orElseThrow().getPartySize()).isEqualTo(5);
+    // --- consumer side: what at-least-once delivery throws at you ------------------------------
+
+    /** The relay sent the events but died before deleting them: the next run sends them again. */
+    @Test
+    void eventsSentTwiceAfterARelayCrashAreHandledOnce(CapturedOutput output) {
+        ReservationId id = reservationService.confirm("Ada", 4, EVENING);
+        reservationService.changePartySize(id, 5);
+
+        List<OutboxEventDto> sentBeforeCrash = sendWithoutAcknowledging(id);
+        relay.publishPending(); // the "next run" sends the same rows again, then deletes them
+
+        awaitTrue(() -> output.getOut().split("Skipping duplicate", -1).length - 1 >= 2);
+        assertThat(sentBeforeCrash).hasSize(2);
+        assertThat(count("select count(*) from processed_event where event_key = ?", id.toString())).isEqualTo(2);
+        assertThat(viewRepository.findById(id.getId()).orElseThrow().getPartySize()).isEqualTo(5);
     }
 
     @Test
     void lateEventDoesNotOverwriteNewerState(CapturedOutput output) {
-        UUID reservationId = UUID.randomUUID();
+        ReservationId id = reservationService.confirm("Ada", 4, EVENING);
+        reservationService.changePartySize(id, 6);
 
-        send(reservationId, UUID.randomUUID(), "ReservationPartySizeChanged", partySizeChangedJson(reservationId, 6, 2));
-        UUID late = send(reservationId, UUID.randomUUID(), "ReservationConfirmed",
-                confirmedJson(reservationId, "Late", 2, 1));
+        // Deliver revision 2 before revision 1 (as if revision 1 were redelivered late).
+        List<OutboxEventDto> events = outboxRows(id);
+        transactionTemplate.executeWithoutResult(s -> {
+            events.reversed().forEach(e -> kafkaTemplate.send(recordMapper.toProducerRecord(e)).join());
+            jdbc.update("delete from event_outbox where entity_id = ?", id.toString());
+        });
 
-        awaitProcessed(late);
-        ReservationView view = viewRepository.findById(reservationId).orElseThrow();
+        awaitTrue(() -> count("select count(*) from processed_event where event_key = ?", id.toString()) == 2);
+        ReservationView view = viewRepository.findById(id.getId()).orElseThrow();
         assertThat(view.getPartySize()).isEqualTo(6);
         assertThat(view.getLastRevision()).isEqualTo(2);
         assertThat(output.getOut())
                 .contains("earlier events are late or missing")
-                .contains("Ignoring stale ReservationConfirmed (revision 1)");
+                .contains("Ignoring stale reservation.confirmed (revision 1)");
     }
 
     @Test
-    void poisonMessageGoesToTheDeadLetterTopicAndDoesNotBlockThePartition() {
-        UUID reservationId = UUID.randomUUID();
-        UUID poisonId = send(reservationId, UUID.randomUUID(), "ReservationConfirmed", "this is not json");
-        UUID next = send(reservationId, UUID.randomUUID(), "ReservationConfirmed",
-                confirmedJson(reservationId, "Ada", 3, 1));
+    void brokenMessagesGoToTheDeadLetterTopicAndDoNotBlockThePartition() {
+        String key = UUID.randomUUID().toString();
+        // 1. standard headers, but the payload is not JSON
+        OutboxEventDto badPayload = dto(key, "reservation.confirmed", 900_001, "this is not json");
+        kafkaTemplate.send(recordMapper.toProducerRecord(badPayload)).join();
+        // 2. no headers at all: the consumer library cannot even read it
+        kafkaTemplate.send(new ProducerRecord<>(topic, key, "{}".getBytes(StandardCharsets.UTF_8))).join();
+        // 3. a good event behind them, same key, same partition
+        String good = """
+                {"reservationId":"%s","guestName":"Ada","partySize":3,"reservedFor":"2026-11-06T19:00:00Z",\
+                "revision":1,"occurredAt":"2026-11-06T10:00:00Z"}""".formatted(key);
+        OutboxEventDto goodEvent = dto(key, "reservation.confirmed", 900_002, good);
+        kafkaTemplate.send(recordMapper.toProducerRecord(goodEvent)).join();
 
-        awaitProcessed(next);
-        assertThat(count("select count(*) from processed_event where event_id = ?", poisonId))
+        awaitTrue(() -> viewRepository.findById(UUID.fromString(key)).isPresent());
+        assertThat(count("select count(*) from processed_event where event_id = ?", badPayload.id().getId()))
                 .as("failed handling is rolled back, including the processed mark").isZero();
-        assertThat(eventIdsOn(topic + ".DLT")).contains(poisonId.toString());
+        List<String> deadLetterKeys = recordsOn(topic + ".DLT").stream().map(r -> r.key()).toList();
+        assertThat(deadLetterKeys).filteredOn(key::equals).hasSize(2);
     }
 
-    // --- helpers -----------------------------------------------------------------------
+    @Test
+    void unknownEventTypesAreSkipped() {
+        String key = UUID.randomUUID().toString();
+        OutboxEventDto unknown = dto(key, "reservation.something-new", 900_003, "{}");
+        kafkaTemplate.send(recordMapper.toProducerRecord(unknown)).join();
+        String good = """
+                {"reservationId":"%s","guestName":"Lin","partySize":2,"reservedFor":"2026-11-06T19:00:00Z",\
+                "revision":1,"occurredAt":"2026-11-06T10:00:00Z"}""".formatted(key);
+        kafkaTemplate.send(recordMapper.toProducerRecord(dto(key, "reservation.confirmed", 900_004, good))).join();
 
-    private UUID send(UUID key, UUID eventId, String eventType, String json) {
-        ProducerRecord<String, String> record = new ProducerRecord<>(topic, key.toString(), json);
-        record.headers()
-                .add(OutboxRelay.HEADER_EVENT_ID, eventId.toString().getBytes(StandardCharsets.UTF_8))
-                .add(OutboxRelay.HEADER_EVENT_TYPE, eventType.getBytes(StandardCharsets.UTF_8));
-        kafkaTemplate.send(record).join();
-        return eventId;
+        awaitTrue(() -> viewRepository.findById(UUID.fromString(key)).isPresent());
+        assertThat(count("select count(*) from processed_event where event_id = ?", unknown.id().getId())).isZero();
     }
 
-    private static String confirmedJson(UUID id, String guest, int partySize, long revision) {
-        return """
-                {"reservationId":"%s","guestName":"%s","partySize":%d,"reservedFor":"2026-11-06T19:00:00Z",\
-                "revision":%d,"occurredAt":"2026-11-06T10:00:00Z"}""".formatted(id, guest, partySize, revision);
+    // --- helpers -------------------------------------------------------------------------------
+
+    /** Sends the reservation's outbox rows to Kafka but leaves them in the outbox (a crash before the delete). */
+    private List<OutboxEventDto> sendWithoutAcknowledging(ReservationId id) {
+        List<OutboxEventDto> events = outboxRows(id);
+        events.forEach(e -> kafkaTemplate.send(recordMapper.toProducerRecord(e)).join());
+        return events;
     }
 
-    private static String partySizeChangedJson(UUID id, int partySize, long revision) {
-        return """
-                {"reservationId":"%s","partySize":%d,"revision":%d,"occurredAt":"2026-11-06T10:00:00Z"}"""
-                .formatted(id, partySize, revision);
+    /** The reservation's rows as the Outbox-Service would read them, without deleting them. */
+    private List<OutboxEventDto> outboxRows(ReservationId id) {
+        List<OutboxEventDto> result = new ArrayList<>();
+        transactionTemplate.executeWithoutResult(s -> {
+            List<Partition> all = IntStream.range(0, 3).mapToObj(Partition::of).toList();
+            try (Stream<OutboxEventDto> events = readOutbox.readNext(TopicName.of(topic), all)) {
+                events.filter(e -> e.eventKey() != null && e.eventKey().getKey().equals(id.toString()))
+                        .forEach(result::add);
+            }
+            jdbc.update("update event_outbox set is_read = false where entity_id <> ?", id.toString());
+        });
+        result.sort(Comparator.comparing(OutboxEventDto::sequenceId));
+        return result;
     }
 
-    private void awaitProcessed(UUID eventId) {
-        awaitTrue(() -> count("select count(*) from processed_event where event_id = ?", eventId) == 1);
+    /** A hand-made event in exactly the record format the Outbox-Service publishes. */
+    private OutboxEventDto dto(String key, String eventType, long sequenceId, String payload) {
+        return new OutboxEventDto(EventId.ofRandomUuid(), sequenceId, TopicName.of(topic),
+                Partition.of(Math.abs(key.hashCode()) % 3), ZonedDateTime.now(), null, null, null,
+                EventKey.of(key), EventType.of(eventType, 1), EntityIdentifier.of("reservation", key), List.of(),
+                payload.getBytes(StandardCharsets.UTF_8));
     }
 
     private long count(String sql, Object arg) {
@@ -210,28 +292,37 @@ class MessagingIntegrationTest {
         return result == null ? 0 : result;
     }
 
-    private List<String> eventIdsOn(String dltTopic) {
+    private static String header(org.apache.kafka.clients.consumer.ConsumerRecord<String, byte[]> record, String name) {
+        return new String(record.headers().lastHeader(name).value(), StandardCharsets.UTF_8);
+    }
+
+    private List<org.apache.kafka.clients.consumer.ConsumerRecord<String, byte[]>> recordsOn(String topicName) {
         Map<String, Object> props = Map.of(
                 ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, brokers,
-                ConsumerConfig.GROUP_ID_CONFIG, "test-dlt-" + UUID.randomUUID(),
+                ConsumerConfig.GROUP_ID_CONFIG, "test-" + UUID.randomUUID(),
                 ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest",
                 ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
-                ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
-        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
-            consumer.subscribe(List.of(dltTopic));
-            ConsumerRecords<String, String> records = consumer.poll(Duration.ofSeconds(10));
-            return java.util.stream.StreamSupport.stream(records.spliterator(), false)
-                    .map(r -> new String(r.headers().lastHeader(OutboxRelay.HEADER_EVENT_ID).value(),
-                            StandardCharsets.UTF_8))
-                    .toList();
+                ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class);
+        List<org.apache.kafka.clients.consumer.ConsumerRecord<String, byte[]>> all = new ArrayList<>();
+        try (KafkaConsumer<String, byte[]> consumer = new KafkaConsumer<>(props)) {
+            consumer.subscribe(List.of(topicName));
+            long deadline = System.nanoTime() + Duration.ofSeconds(15).toNanos();
+            while (System.nanoTime() < deadline) {
+                ConsumerRecords<String, byte[]> records = consumer.poll(Duration.ofSeconds(2));
+                StreamSupport.stream(records.spliterator(), false).forEach(all::add);
+                if (!all.isEmpty() && records.isEmpty()) {
+                    break;
+                }
+            }
         }
+        return all;
     }
 
     private static void awaitTrue(BooleanSupplier condition) {
-        long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+        long deadline = System.nanoTime() + Duration.ofSeconds(25).toNanos();
         while (!condition.getAsBoolean()) {
             if (System.nanoTime() > deadline) {
-                throw new AssertionError("Condition not met within 20 seconds");
+                throw new AssertionError("Condition not met within 25 seconds");
             }
             try {
                 Thread.sleep(100);

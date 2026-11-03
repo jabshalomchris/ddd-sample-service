@@ -1,0 +1,5 @@
+# Profile "local-relay": publish the outbox from inside this service instead of a separate
+# Outbox-Service container. For local development and the demo only.
+sample:
+  local-relay:
+    enabled: true

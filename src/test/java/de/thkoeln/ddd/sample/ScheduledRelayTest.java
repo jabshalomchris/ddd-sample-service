@@ -28,8 +28,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * walkthrough from the README, section 1, as a test.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
-        "outbox.relay.enabled=true",
-        "outbox.relay.interval-ms=200",
+        "sample.local-relay.enabled=true",
+        "sample.local-relay.interval-ms=200",
         "spring.kafka.bootstrap-servers=${spring.embedded.kafka.brokers}"
 })
 @EmbeddedKafka
@@ -91,8 +91,9 @@ class ScheduledRelayTest {
         assertThat(page.body()).contains("Outbox demo");
         assertThat(jsonMapper.readTree(call("GET", "/demo/reservations", "").body()).toString())
                 .contains(id.toString()).contains("CANCELLED");
-        String outbox = call("GET", "/demo/outbox", "").body();
-        assertThat(outbox).contains("ReservationConfirmed", "ReservationPartySizeChanged", "ReservationCancelled");
+        assertThat(call("GET", "/demo/outbox", "").body()).as("everything sent").doesNotContain(id.toString());
+        assertThat(call("GET", "/demo/delivered", "").body())
+                .contains("reservation.confirmed", "reservation.party-size-changed", "reservation.cancelled");
         assertThat(call("GET", "/demo/view", "").body()).contains(id.toString()).contains("\"lastRevision\":3");
     }
 

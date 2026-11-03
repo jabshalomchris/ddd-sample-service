@@ -18,9 +18,4 @@ public sealed interface ReservationEvent
     long revision();
 
     Instant occurredAt();
-
-    /** Name used in the {@code eventType} header. Not part of the JSON payload. */
-    default String eventType() {
-        return getClass().getSimpleName();
-    }
 }

@@ -1,159 +1,218 @@
 # Sample service: outbox, Kafka and idempotent consumers
 
-> **Draft 2, 30.10.2026.** Architecture team, workstream 2 (helper libraries: usage guide, sample service, outbox).
+> **Draft 3, 03.11.2026.** Architecture team, workstream 2 (helper libraries: usage guide, sample service, outbox).
 > Lead: Judah. Newcomer read: Dongxin. ADR on outbox and library use: Eldar.
+> Now built on the supervisors' libraries: **outbox-lib-jpa 10.0.1**, **consumer-lib 1.0.0** and the **Outbox-Service 4.1.0** ([Microservice Dungeon](https://gitlab.com/microservice-dungeon/services), Daniel Köllgen).
 
-This is a reference for every bounded context team. It shows, in a small running service, how to publish domain events reliably and how to consume them safely on our stack (Kafka and PostgreSQL from the `ddd-demo` docker-compose).
+This is a reference for every bounded context team. It shows, in a small running service, how to publish domain events reliably with the outbox library and how to consume them safely with the consumer library, on our stack (Kafka and PostgreSQL from the `ddd-demo` docker-compose).
 
-Two things to know before you copy anything:
-
-- **`Reservation` is only an example.** It is not one of our bounded contexts and makes no modelling decision for anyone. Look at the mechanics, not the model.
-- **`outbox` and `inbox` are stand-ins.** The supervisors provide helper libraries for the outbox and for Kafka producers and consumers. When we have them, those packages are replaced. The rules in this guide stay the same.
+`Reservation` is **only an example**. It is not one of our bounded contexts and makes no modelling decision for anyone. Look at the mechanics, not the model.
 
 ## 1. Run it
 
-You need Java 21 and Docker.
+You need Java 21, Docker, and access to the libraries' GitLab package registry (declared in `pom.xml`).
+
+If Maven cannot download the libraries (the registry may need a token), build them from source once; Maven then finds them locally:
 
 ```bash
-# in the ddd-demo repository
-docker compose up -d          # Kafka on localhost:9092, Kafka UI on localhost:8090, PostgreSQL on localhost:5432
-
-# in this repository
-./mvnw spring-boot:run        # service on localhost:8080 (Windows: .\mvnw.cmd spring-boot:run)
+git clone https://gitlab.com/microservice-dungeon/services/outbox-lib.git
+git clone https://gitlab.com/microservice-dungeon/services/consumer-lib.git
+cd outbox-lib   && ./mvnw install -DskipTests && cd ..   # their tests need Docker; skipping them is fine here
+cd consumer-lib && ./mvnw install -DskipTests && cd ..
 ```
+
+```bash
+# in the ddd-demo repository: Kafka on localhost:9092, Kafka UI on localhost:8090, PostgreSQL on localhost:5432
+docker compose up -d
+```
+
+The service only *writes* events into its outbox table. Something has to *send* them to Kafka. Pick one:
+
+**A. With the Outbox-Service (the real setup)**
+
+```bash
+# in this repository
+docker compose -f docker-compose.outbox-service.yaml up -d
+./mvnw spring-boot:run                     # Windows: .\mvnw.cmd spring-boot:run
+```
+
+**B. Without it (local development, demo fallback)**
+
+```bash
+./mvnw spring-boot:run -Dspring-boot.run.profiles=local-relay
+# Windows PowerShell needs quotes: .\mvnw.cmd spring-boot:run "-Dspring-boot.run.profiles=local-relay"
+```
+
+The `local-relay` profile switches on `LocalOutboxRelay`, which does inside the service what the Outbox-Service does, with the same library calls and the same Kafka record format. Never use A and B at the same time: every partition must have exactly one reader.
 
 ### The demo page
 
-Open **http://localhost:8080**. One page shows the whole path of an event, in three panels:
+Open **http://localhost:8080**. One page shows the whole path of an event:
 
-1. **Reservations** (the aggregate): create, change and cancel reservations with buttons.
-2. **Outbox**: every event the service wrote, marked *waiting* until the relay has sent it to Kafka, then *sent*.
-3. **Consumer's view**: what a neighbouring context built from the events alone.
+1. **Reservations** (the aggregate): create, change and cancel with buttons.
+2. **Outbox**: events written but not yet sent. The Outbox-Service deletes a row once Kafka has confirmed it, so this table is usually empty.
+3. **Received events** and **Consumer's view**: what a neighbouring context processed (with each event's `sequence_id`) and the copy it built from the events alone.
 
-The short ID next to each name (for example `#7b09`) is the start of the reservation ID, so you can follow one reservation across all three panels. Cancelling twice or entering a party of 13 shows the error the API returns (409 and 400).
+The short ID next to each name (for example `#7b09`) lets you follow one reservation across the panels. Cancelling twice or entering a party of 13 shows the API's error (409 and 400).
 
-To see the outbox at work, stop the `kafka` container in Docker Desktop, change a reservation, and watch the new event stay *waiting*. Start Kafka again and it changes to *sent* by itself.
+To see the outbox at work, stop the `sample-outbox-service` container (or `kafka`) in Docker Desktop, change a reservation, and watch the event stay *waiting*. Start it again and the event goes out by itself.
 
-The page (`src/main/resources/static/index.html`) and its read-only `/demo/*` endpoints (`demo` package) exist only for showing the service. A real service would not expose its outbox like this; do not copy them.
+The page (`static/index.html`) and its read-only `/demo/*` endpoints (`demo` package) exist only for showing the service. Do not copy them.
 
-**Without Docker:** `./mvnw test -Dtest=DemoPageRunner -Ddemo.run=true` starts the service with an embedded PostgreSQL and an in-process Kafka on port 8080 for 30 minutes. The relay runs every 4 seconds there, so you can see events wait briefly. Stopping Kafka is not possible in this mode.
+**Without Docker:** `./mvnw test -Dtest=DemoPageRunner -Ddemo.run=true` starts the service with an embedded PostgreSQL, an in-process Kafka and the local relay (every 4 s, so you can see events wait) on port 8080 for 30 minutes.
 
 ### Or from the command line
 
 ```bash
 ID=$(curl -s -X POST localhost:8080/reservations -H 'Content-Type: application/json' \
   -d '{"guestName":"Ada","partySize":4,"reservedFor":"2026-11-06T19:00:00Z"}' | sed -E 's/.*"id":"([^"]+)".*/\1/')
-
 curl -X PUT  localhost:8080/reservations/$ID/party-size   -H 'Content-Type: application/json' -d '{"partySize":6}'
 curl -X POST localhost:8080/reservations/$ID/cancellation -H 'Content-Type: application/json' -d '{"reason":"ill"}'
 ```
 
-Then look at:
+Kafka UI, topic `bl.reservation.events.v1`: three messages, key = your reservation ID, all on one partition, with the standard headers (`event_id`, `sequence_id`, `event_type`, …).
 
-- **Kafka UI** (http://localhost:8090), topic `sample.reservation-events`: three messages, all with your reservation ID as key, on the same partition, with `eventId` and `eventType` headers.
-- **PostgreSQL**, schema `sample_service`:
-  - `outbox_message`: three rows, each with `published_at` set.
-  - `reservation_view`: one row, status `CANCELLED`, revision 3. The consumer built it from the events alone.
-
-Run the tests with `./mvnw test`. They need no Docker: they use real PostgreSQL 18 binaries and an in-process Kafka broker. (PostgreSQL refuses to start as root, so run them as a normal user.)
+Run the tests with `./mvnw test`. They need no Docker: real PostgreSQL 18 binaries and an in-process Kafka broker. (PostgreSQL refuses to start as root, so run them as a normal user.)
 
 ## 2. How an event travels
 
 ```
- ReservationService (one DB transaction)                 OutboxRelay (every 500 ms)
- ┌──────────────────────────────────────┐               ┌──────────────────────────┐
- │ reservation.cancel(...)               │               │ lock oldest unpublished  │
- │ save reservation          ──┐         │               │ send to Kafka, key =     │
- │ append event to outbox    ──┴─ commit │──────────────▶│   aggregate ID, wait ack │
- └──────────────────────────────────────┘               │ set published_at, commit │
-                                                         └────────────┬─────────────┘
-                                                                      ▼
- ReservationEventListener (one DB transaction)            Kafka topic, 3 partitions
- ┌──────────────────────────────────────┐               ┌──────────────────────────┐
- │ seen this eventId before? → skip      │◀──────────────│ sample.reservation-events│
- │ revision older than view? → skip      │               └──────────────────────────┘
- │ update own view           ── commit   │
- └──────────────────────────────────────┘
-   offset committed after the DB commit
+ Your service (one DB transaction)              Outbox-Service (own container, polls every 500 ms)
+ ┌───────────────────────────────────────┐      ┌───────────────────────────────────────────┐
+ │ reservation.cancel(...)               │      │ read new rows of event_outbox             │
+ │ save reservation          ──┐         │      │ send to Kafka (key = aggregate ID)        │
+ │ writeOutbox.write(event)  ──┴─ commit │─────▶│ wait until Kafka confirmed all of them    │
+ └───────────────────────────────────────┘      │ delete the rows                           │
+   outbox-lib-jpa                               └──────────────────────┬────────────────────┘
+                                                                       ▼
+ Neighbouring service (one DB transaction)      Kafka topic bl.reservation.events.v1 (3 partitions)
+ ┌───────────────────────────────────────┐                             │
+ │ consumer-lib: read headers, pick the  │◀────────────────────────────┘
+ │   handler by event_type               │
+ │ seen this event_id before? → skip     │
+ │ revision older than view? → skip      │
+ │ update own data          ── commit    │  offset committed after the DB commit
+ └───────────────────────────────────────┘
 ```
 
 The point of the outbox: the state change and the event are written **in the same transaction**. Either both happen or neither does. Sending to Kafka directly from the service would allow "saved but never published" and "published but rolled back".
 
-## 3. Publishing events: rules
+## 3. Publishing events with the outbox library
 
-1. **Never call `KafkaTemplate` from your domain or application service.** Record events in the aggregate, then write them to the outbox in the same transaction (`ReservationEventPublisher`). `OutboxWriter` uses `Propagation.MANDATORY`, so calling it outside a transaction fails immediately instead of silently breaking the guarantee.
-2. **Use the aggregate ID as the message key.** Kafka keeps order only within a partition, and the key decides the partition. Same key, same partition, events arrive in the order they happened. Without a key, two events of one aggregate can overtake each other. Our topics have 3 partitions on purpose, so this shows up locally and not only later.
-3. **Give every event a `revision`.** 1 for the first event of an aggregate, +1 for each later one. Consumers use it to recognise late events. (The JPA `@Version` field is for optimistic locking and is not used for this.)
-4. **Name events as past-tense business facts** (`ReservationCancelled`, not `CancelReservation` or `ButtonClicked`). That is the exploration team's rule from the EventStorming, and the event type is part of your API.
+### Setup (once per service)
+
+1. **Registry and dependency.** Add the GitLab registry and `de.microservice-dungeon:outbox-lib-jpa` to `pom.xml` (see this repository's `pom.xml`). Use `outbox-lib-jpa`, never `outbox-lib-direct` for anything but quick experiments: direct mode **loses events** on any failure.
+2. **Let Spring find the library's entity.** On the application class, list both your package and the library's: `@EnableJpaRepositories({"<your.package>", "de.microservicedungeon"})` and the same for `@EntityScan` (`SampleServiceApplication`).
+3. **Create the outbox table yourself.** The library does not. Copy its script into a Flyway migration (`V2__use_outbox_lib.sql`). It lands in your service's own schema.
+4. **Configure your topics.** List every topic you write to under `outbox.topics` (`application.yaml`). The library checks at startup that each one **exists in Kafka** and reads its partition count, so the topic must exist before the service starts. Here the service creates it itself (`MessagingConfig`).
+5. **Set `spring.jpa.hibernate.ddl-auto: none`.** With `validate`, the service does not start: the library's table uses `SMALLINT` columns that its entity maps as `Integer`. The library and the Outbox-Service use `none` too.
+6. **Run one Outbox-Service for your service**, pointed at your schema and your topics (`docker-compose.outbox-service.yaml`).
+
+### Rules
+
+1. **Never call `KafkaTemplate` from your service.** Record events in the aggregate, then call `WriteOutbox.write(...)` in the same transaction (`ReservationEventPublisher`). The library refuses to run outside a transaction (`Propagation.MANDATORY`).
+2. **Implement `OutboxWritableEvent` once per service** (`ReservationOutboxEvent`):
+   - `getKey()` = **the aggregate ID**. Same key, same partition, events of one aggregate stay in order. Without a key, events are spread randomly and arrive out of order.
+   - `getEventType()` = `<entity>.<event-name>` in lowercase with dots and dashes, plus a version, e.g. `reservation.cancelled` v1. Event names are past-tense business facts (the exploration team's rule from the EventStorming). Raise the version when a payload changes incompatibly; never change a published schema.
+   - `getEntityIdentifier()` = `reservation` + ID. Used for debugging.
+   - `getPayload()` = the event as UTF-8 JSON bytes.
+   - `getDelayInterval()` = empty. Delays break ordering and duplicate detection.
+3. **Lock the aggregate.** The library numbers events when they are written, not when they commit, and asks that concurrent changes to one entity are serialised. An `@Version` field on the aggregate does that (`Reservation`).
+4. **Give every event a `revision`** in its payload: 1 for the first event of an aggregate, +1 for each later one. Consumers use it to recognise late events.
 5. **Document every event in AsyncAPI** (`docs/asyncapi.yaml`). The events you publish are your service's API.
-6. **Keep your tables in your own schema.** We share one PostgreSQL instance, but each service sets `currentSchema` in its JDBC URL and only touches its own schema. Reading another service's tables crosses a context boundary.
+6. **Keep your tables in your own schema**, including `event_outbox`. Reading another service's tables crosses a context boundary.
 
 ## 4. What the outbox guarantees, and what it does not
 
 | Guaranteed | Not guaranteed |
 |---|---|
-| No event without the state change, and no state change without the event | **Exactly once.** Delivery is *at least once*: if the service crashes after Kafka acknowledged a message but before `published_at` is committed, the message is sent again. |
-| Events of one aggregate are published in the order they were written | Order *across* aggregates |
-| An event that Kafka could not take is retried in the next run, and later events wait behind it | How fast: up to one relay interval (500 ms) plus Kafka latency |
+| No event without the state change, and no state change without the event | **Exactly once.** If the Outbox-Service fails after sending but before deleting the rows, it sends them again. Delivery is *at least once*. |
+| Events with the same key are published in the order they were written | Order across keys, partitions or topics |
+| An event that cannot be sent stays in the outbox and is retried (backoff up to 30 s) | How fast: polling interval plus Kafka latency. One event that always fails blocks its whole topic until removed by hand. |
 | | That anybody consumed it |
 
 So every consumer must cope with **duplicates**, and should cope with **late or missing** events. That is exactly what the 3-point level of the implementation criterion asks for: *messages that arrive twice, out of order, or not at all are handled as a design concern.*
 
-## 5. Consuming events: rules
+## 5. Consuming events with the consumer library
 
-1. **Skip duplicates by event ID**, in the same transaction as your own writes (`IdempotencyGuard`). If your handler fails, the "processed" mark rolls back too, and the redelivered event is handled again. If you mark it in a separate transaction, a failure loses the event.
-2. **Skip late events by revision.** Keep the last revision you applied per aggregate and ignore anything not newer (`ReservationView`). A gap (revision 3 arriving when you have 1) means something is late or missing; the sample logs a warning and applies it.
-3. **Write your own DTOs from the producer's AsyncAPI file.** Never import another context's classes. Ignore fields you do not need (`@JsonIgnoreProperties(ignoreUnknown = true)`) and event types you do not know. Then the producer can add fields and events without breaking you.
-4. **Let exceptions propagate.** A failing record is retried twice, one second apart, then moved to `<topic>.DLT` so it does not block the partition (`MessagingConfig`). Swallowing an exception means the offset is committed and the event is lost without a trace.
-5. **The offset is committed after your database commit.** A crash between the two causes a redelivery, which rule 1 handles.
+### Setup
+
+1. Add the GitLab registry and `de.microservice-dungeon:consumer-lib` to `pom.xml`.
+2. Records arrive as bytes: `spring.kafka.consumer.value-deserializer: org.apache.kafka.common.serialization.ByteArrayDeserializer`.
+3. Write **one `EventSpecification` per event type** you need (`ReservationEventHandlers`): it names the `event_type` and version and processes the payload.
+4. Register them in a `ProcessorChain` from the injected `KafkaProcessorChainFactory` and call `chain.process(record)` from a `@KafkaListener` method marked `@Transactional` (`ReservationEventListener`).
+
+Note that the library's README example uses `KafkaDefaultHeaders`; the class is `KafkaDefaultHeader`.
+
+### Rules
+
+1. **Skip duplicates by `event_id`, yourself.** Consumer-lib 1.0.0 reads the headers and picks the handler, but it does **not** detect duplicates yet. The sample does it in a base class (`IdempotentEventSpecification`): the `event_id` goes into a `processed_event` table in the same transaction as your own writes. If your handler fails, the mark rolls back too, and the redelivered event is handled again.
+2. **Do not filter duplicates by a `sequence_id` high-watermark alone.** The library's docs suggest it, but the id is assigned when an event is *written*, not when it *commits*. Two transactions on different entities in the same partition can commit in the opposite order, and the Outbox-Service then publishes the lower id after the higher one. A watermark would silently drop that event; the `event_id` check never does.
+3. **Skip late events by revision.** Keep the last revision you applied per aggregate and ignore anything not newer (`ReservationView`).
+4. **Write your own DTOs from the producer's AsyncAPI file.** Never import another context's classes. Ignore fields you do not need (`@JsonIgnoreProperties(ignoreUnknown = true)`). Event types without a handler are skipped by the library, so producers can add new events without breaking you.
+5. **Let exceptions propagate.** The library rethrows (leave `onError()` empty), the transaction rolls back, Spring Kafka retries twice and then moves the record to `<topic>.DLT` (`MessagingConfig`). That also catches records with missing or broken headers.
+6. **The offset is committed after your database commit.** A crash in between causes a redelivery, which rule 1 handles.
 
 ## 6. Copying this into your service
 
 | File | What to do |
 |---|---|
-| `outbox/*`, `inbox/*`, `V1__init.sql` (outbox and processed_event tables) | Copy as they are, until the supervisors' library replaces them |
-| `shared/application/MessagingConfig.java` | Copy; rename the topic bean and property |
-| `reservation/application/ReservationEventPublisher.java` | One per aggregate that publishes events |
-| `reservation/domain/Reservation.java` | Pattern only: `pendingEvents`, `pullEvents()`, `revision` |
-| `reservationview/application/ReservationEventListener.java` | Pattern for every listener: guard, revision check, own DTOs |
-| `application.yaml` | Change schema, topic names and consumer group |
+| `pom.xml` (repositories, two library dependencies) | Copy |
+| `V2__use_outbox_lib.sql` (`event_outbox` part) and `processed_event` from `V1__init.sql` | Copy into your migrations |
+| `SampleServiceApplication` (`@EnableJpaRepositories`, `@EntityScan`) | Copy the two annotations |
+| `application.yaml` (`outbox.topics`, byte-array (de)serializers, `ddl-auto: none`) | Copy; change schema, topics and consumer group |
+| `ReservationOutboxEvent`, `ReservationEventPublisher` | Pattern: one per aggregate that publishes |
+| `inbox/*` (`IdempotencyGuard`, `IdempotentEventSpecification`) | Copy as they are |
+| `ReservationEventHandlers`, `ReservationEventListener` | Pattern for every event you consume |
+| `shared/application/MessagingConfig` | Copy; rename the topic |
+| `docker-compose.outbox-service.yaml` | Template for your service's Outbox-Service |
 | `docs/asyncapi.yaml` | Template for your own event API |
-| `demo/*`, `static/index.html`, `DemoPageRunner` | Do not copy. Demo only; for your own dummy client, build on your service's real API |
+| `localrelay/*` | Only if you have no Outbox-Service locally. Remove it once you do. |
+| `demo/*`, `static/index.html`, `DemoPageRunner` | Do not copy. For your own dummy client, build on your service's real API |
 
-The packages follow the course's DDD package convention (one top-level package per aggregate, with `domain` and `application`). Before copying, check this against the starter platform the tactical team hands out on 06.11.; where they differ, theirs wins.
+The packages follow the course's DDD package convention (one top-level package per aggregate, with `domain` and `application`). Check this against the starter platform the tactical team hands out on 06.11.; where they differ, theirs wins.
 
 ## 7. Tests that show the guarantees
 
-`MessagingIntegrationTest` (real PostgreSQL 18, in-process Kafka):
+`MessagingIntegrationTest` (real PostgreSQL 18, in-process Kafka, the real libraries):
 
 | Test | Shows |
 |---|---|
-| `savingTheAggregateAlsoWritesTheEventToTheOutbox` | aggregate row and outbox row are written together |
+| `savingTheAggregateAlsoWritesTheEventToTheOutbox` | the library writes the event with key, type, version and payload |
 | `rollbackRemovesTheAggregateAndItsEventTogether` | a failure after the save leaves neither behind |
-| `outboxCannotBeWrittenOutsideATransaction` | `MANDATORY` stops misuse |
-| `relayPublishesInOrderAndTheConsumerFollows` | full path: confirm, change, cancel, view ends at revision 3 |
-| `duplicateDeliveryIsHandledOnce` | the same event ID twice is processed once |
+| `outboxCannotBeWrittenOutsideATransaction` | the library refuses to run without a transaction |
+| `eventsOfOneReservationShareAPartitionAndKeepTheirOrder` | one aggregate, one partition, written in order |
+| `relayPublishesAndTheConsumerFollows` | full path: confirm, change, cancel; view ends at revision 3; outbox rows deleted |
+| `publishedRecordsCarryTheStandardHeaders` | records carry `event_id`, `sequence_id`, `event_type`, … |
+| `eventsSentTwiceAfterARelayCrashAreHandledOnce` | the relay sends, "crashes" before deleting, sends again; each event is handled once |
 | `lateEventDoesNotOverwriteNewerState` | revision 1 after revision 2 is ignored |
-| `poisonMessageGoesToTheDeadLetterTopicAndDoesNotBlockThePartition` | broken message ends in `.DLT`, the next one is processed |
+| `brokenMessagesGoToTheDeadLetterTopicAndDoNotBlockThePartition` | bad JSON and missing headers end in `.DLT`; the next event is processed |
+| `unknownEventTypesAreSkipped` | a new event type does not break the consumer |
 
-`ScheduledRelayTest` runs the walkthrough from section 1 over real HTTP with the scheduler switched on, including the 409 for cancelling twice and the 400 for a party of 13, and checks that the demo page and its `/demo/*` endpoints show the same state.
+`ScheduledRelayTest` runs the walkthrough from section 1 over real HTTP with the relay on its schedule. `ReservationTest` covers the aggregate's own invariants.
 
-`ReservationTest` covers the aggregate's own invariants.
+The setup was also run end to end with the **real Outbox-Service 4.1.0** (from source, against the same embedded database and broker): events were published and consumed; stopped, it left new events waiting in the outbox; restarted, it sent them by itself.
 
-## 8. Known weak points and open questions
+## 8. Findings, weak points and open questions
 
-Weak points in this draft:
+Findings from reading and testing the libraries (outbox-lib 10.0.1, consumer-lib 1.0.0, Outbox-Service 4.1.0):
 
-- **Run one relay per service.** `SKIP LOCKED` lets two relay instances work in parallel without blocking, but then two events of the same aggregate could be sent by different instances and overtake each other. For the course, one instance per service is enough.
-- **Published outbox rows are never deleted.** Fine for a semester; a real system needs a cleanup job.
+- `ddl-auto: validate` fails with the library's table (`SMALLINT` vs `Integer`). Use `none`.
+- consumer-lib 1.0.0 does not detect duplicates or manage transactions, although its README mentions both.
+- The libraries state PostgreSQL 17. Our stack runs 18; all tests and the end-to-end run passed on 18.
+- The outbox-lib README still shows version 10.0.0; the repository is at 10.0.1.
+
+Weak points of this sample:
+
 - **Nobody watches the dead-letter topics yet.** A message in `.DLT` is lost to the business until someone looks.
-- **The relay sends one message at a time and waits for each acknowledgement.** Slow, but simple and correct.
+- **The local relay is a stand-in.** It reads all partitions in one instance; never run it next to an Outbox-Service.
 
-Open questions (for the team and the supervisors):
+Open questions (team and supervisors):
 
-1. Where are the supervisors' helper libraries, and what is their API? This decides how much of `outbox` and `inbox` survives.
-2. Boundary with workstream 1 (Hyokyung): she covers the stack and installing the producer/consumer libraries, this guide covers using them. Agreed?
-3. Topic naming convention (here `<service>.<aggregate>-events`). For the infrastructure ADR.
-4. One schema per service in the shared database, or one database per service? For Eldar's ADR. This draft uses schemas.
-5. Number of partitions per topic (here 3).
-6. Does this match the tactical team's starter platform (package structure, build, guardrails)?
+1. Outbox-Service image name and tag, and whether the GitLab registries are public or need a token.
+2. One Outbox-Service per service in the shared stack: who adds them to the ddd-demo compose? (Hyokyung, infrastructure ADR.)
+3. Topic and event type naming (here `bl.<entity>.events.v1` and `<entity>.<event>`, as in the Microservice Dungeon).
+4. Who creates topics: each service on startup (as here) or centrally?
+5. One schema per service in the shared database (this sample), or one database per service? (Eldar's ADR.)
+6. Number of partitions per topic (here 3).
+7. Does this match the tactical team's starter platform (package structure, build, guardrails)?

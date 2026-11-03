@@ -1,14 +1,17 @@
 asyncapi: 3.1.0
 info:
   title: sample-service event API
-  version: 0.1.0
+  version: 0.2.0
   description: |
     Events published by the sample service. Every bounded context documents the
     events it publishes in a file like this one; consumers write their own DTOs
     from it instead of importing the producer's classes.
 
-    Delivery is at least once. Consumers must handle duplicates (same eventId)
-    and late events (revision not newer than the last one they saw).
+    Records are produced by the supervisors' outbox library and Outbox-Service, so
+    they carry the Microservice Dungeon standard headers (see EventHeaders).
+    Delivery is at least once and in order per partition. Consumers must handle
+    duplicates (same event_id) and late events (revision not newer than the last
+    one they saw).
 
 servers:
   local:
@@ -18,11 +21,11 @@ servers:
 
 channels:
   reservationEvents:
-    address: sample.reservation-events
+    address: bl.reservation.events.v1
     description: |
       All events of the Reservation aggregate. The message key is the
       reservationId, so all events of one reservation are on one partition
-      and arrive in the order they happened.
+      and arrive in the order they happened. Payloads are UTF-8 JSON.
     messages:
       ReservationConfirmed:
         $ref: '#/components/messages/ReservationConfirmed'
@@ -40,7 +43,7 @@ operations:
 components:
   messages:
     ReservationConfirmed:
-      summary: A guest's reservation was accepted.
+      summary: "A guest's reservation was accepted. event_type: reservation.confirmed, version 1"
       headers:
         $ref: '#/components/schemas/EventHeaders'
       payload:
@@ -55,7 +58,7 @@ components:
           occurredAt: { type: string, format: date-time }
 
     ReservationPartySizeChanged:
-      summary: The number of guests of a confirmed reservation changed.
+      summary: "The number of guests changed. event_type: reservation.party-size-changed, version 1"
       headers:
         $ref: '#/components/schemas/EventHeaders'
       payload:
@@ -68,7 +71,7 @@ components:
           occurredAt: { type: string, format: date-time }
 
     ReservationCancelled:
-      summary: A reservation was cancelled. No further events follow for it.
+      summary: "A reservation was cancelled; no further events follow. event_type: reservation.cancelled, version 1"
       headers:
         $ref: '#/components/schemas/EventHeaders'
       payload:
@@ -83,18 +86,35 @@ components:
   schemas:
     EventHeaders:
       type: object
-      required: [eventId, eventType, aggregateType]
+      description: |
+        Standard headers set by the outbox library (HeaderKeys). Strings are UTF-8;
+        numbers are big-endian binary, not text.
+      required: [event_id, sequence_id, created_at, event_type, event_type_version]
       properties:
-        eventId:
+        event_id:
           type: string
           format: uuid
-          description: Unique per event. Redeliveries carry the same eventId.
-        eventType:
+          description: Unique per event. A redelivery carries the same event_id.
+        sequence_id:
+          type: integer
+          format: int64
+          description: >
+            8 bytes, big-endian. Assigned when the event is written to the outbox;
+            increases per partition. Not a safe duplicate filter on its own (see README).
+        created_at:
+          type: integer
+          format: int64
+          description: 8 bytes, big-endian, UTC epoch milliseconds.
+        event_type:
           type: string
-          description: Name of the message, e.g. ReservationConfirmed.
-        aggregateType:
+          description: Lowercase name without version, e.g. reservation.cancelled.
+        event_type_version:
+          type: integer
+          format: int32
+          description: 4 bytes, big-endian, greater than 0. Currently 1 for all events.
+        entity:
           type: string
-          example: Reservation
+          description: Optional, for debugging. reservation.<reservationId>
 
     Revision:
       type: integer

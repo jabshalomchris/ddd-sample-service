@@ -16,20 +16,23 @@ spring:
 
   jpa:
     hibernate:
-      ddl-auto: validate   # Flyway owns the schema; Hibernate only checks it matches the entities
+      # Flyway owns the schema. "validate" would be better, but the outbox library's own table uses
+      # SMALLINT columns that its entity maps as Integer, so validation fails at startup.
+      # The library and the Outbox-Service use "none" as well.
+      ddl-auto: none
     open-in-view: false
 
   kafka:
     bootstrap-servers: localhost:9092
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.ByteArraySerializer   # payloads are bytes
       acks: all
       properties:
         enable.idempotence: true
     consumer:
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.ByteArrayDeserializer   # the consumer library reads bytes
       auto-offset-reset: earliest
       enable-auto-commit: false
 
@@ -38,11 +41,18 @@ server:
 
 sample:
   topics:
-    reservation-events: sample.reservation-events
+    # Naming follows the Microservice Dungeon pattern bl.<entity>.events.v<n> ("bl" = business events).
+    # Whether our course adopts this convention is still open (ADR).
+    reservation-events: bl.reservation.events.v1
     partitions: 3
-
-outbox:
-  relay:
-    enabled: true
+  local-relay:
+    # Stand-in for the Outbox-Service. Off by default; switch on with the "local-relay" profile
+    # when no Outbox-Service container reads this service's outbox. Never both at once.
+    enabled: false
     interval-ms: 500
-    batch-size: 100
+
+# Outbox library: every topic this service writes to. The library checks at startup that each
+# one exists in Kafka and reads its partition count.
+outbox:
+  topics:
+    - name: ${sample.topics.reservation-events}
