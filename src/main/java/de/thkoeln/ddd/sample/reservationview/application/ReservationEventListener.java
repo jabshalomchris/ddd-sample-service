@@ -38,7 +38,7 @@ class ReservationEventListener {
     }
 
     @KafkaListener(id = ReservationEventHandlers.CONSUMER_NAME,
-            topics = "${sample.topics.reservation-events}",
+            topics = "${consumer.listener.reservation.topic}",
             groupId = "sample-service." + ReservationEventHandlers.CONSUMER_NAME)
     @Transactional
     void on(ConsumerRecord<String, byte[]> record) {

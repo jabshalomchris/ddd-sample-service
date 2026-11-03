@@ -16,10 +16,14 @@ import de.thkoeln.ddd.sample.reservation.domain.ReservationId;
 import de.thkoeln.ddd.sample.reservationview.domain.ReservationView;
 import de.thkoeln.ddd.sample.reservationview.domain.ReservationViewRepository;
 import io.zonky.test.db.postgres.embedded.EmbeddedPostgres;
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.Config;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.junit.jupiter.api.Test;
@@ -92,6 +96,7 @@ class MessagingIntegrationTest {
     @Autowired TransactionTemplate transactionTemplate;
     @Autowired KafkaTemplate<String, byte[]> kafkaTemplate;
     @Value("${sample.topics.reservation-events}") String topic;
+    @Value("${sample.topics.reservation-ecst}") String ecstTopic;
     @Value("${spring.embedded.kafka.brokers}") String brokers;
 
     // --- producer side: what the outbox library writes ----------------------------------------
@@ -104,7 +109,7 @@ class MessagingIntegrationTest {
         Map<String, Object> row = jdbc.queryForMap("""
                 select topic_name, partition, event_key, event_type, event_type_version, entity_name,
                        convert_from(payload, 'UTF8')::json->>'guestName' as guest
-                from event_outbox where entity_id = ?""", id.toString());
+                from event_outbox where entity_id = ? and topic_name = ?""", id.toString(), topic);
         assertThat(row.get("topic_name")).isEqualTo(topic);
         assertThat(row.get("event_key")).as("key = aggregate id").isEqualTo(id.toString());
         assertThat(row.get("event_type")).isEqualTo("reservation.confirmed");
@@ -140,11 +145,41 @@ class MessagingIntegrationTest {
         reservationService.cancel(id, "ill");
 
         List<Map<String, Object>> rows = jdbc.queryForList(
-                "select partition, event_type from event_outbox where entity_id = ? order by sequence_id",
-                id.toString());
+                "select partition, event_type from event_outbox where entity_id = ? and topic_name = ? order by sequence_id",
+                id.toString(), topic);
         assertThat(rows).extracting(r -> r.get("event_type"))
                 .containsExactly("reservation.confirmed", "reservation.party-size-changed", "reservation.cancelled");
         assertThat(rows).extracting(r -> r.get("partition")).containsOnly(rows.getFirst().get("partition"));
+    }
+
+    /** ECST, as in the MSD services: after every change, the whole current state on a compacted topic. */
+    @Test
+    void everyChangeAlsoWritesTheFullStateForTheCompactedTopic() throws Exception {
+        ReservationId id = reservationService.confirm("Ada", 4, EVENING);
+        reservationService.changePartySize(id, 4); // no change: no event, no new state
+        reservationService.changePartySize(id, 6);
+        reservationService.cancel(id, "ill");
+
+        List<Map<String, Object>> states = jdbc.queryForList("""
+                select event_key, event_type,
+                       convert_from(payload, 'UTF8')::json->>'revision' as revision,
+                       convert_from(payload, 'UTF8')::json->>'partySize' as party_size,
+                       convert_from(payload, 'UTF8')::json->>'status' as status
+                from event_outbox where entity_id = ? and topic_name = ? order by sequence_id""",
+                id.toString(), ecstTopic);
+        assertThat(states).hasSize(3).allSatisfy(row -> {
+            assertThat(row.get("event_type")).isEqualTo("reservation.state-transfer");
+            assertThat(row.get("event_key")).as("same key as the events: compaction keeps one per reservation")
+                    .isEqualTo(id.toString());
+        });
+        assertThat(states).extracting(row -> row.get("revision")).containsExactly("1", "2", "3");
+        assertThat(states.getLast()).containsEntry("party_size", "6").containsEntry("status", "CANCELLED");
+
+        ConfigResource resource = new ConfigResource(ConfigResource.Type.TOPIC, ecstTopic);
+        try (Admin admin = Admin.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, brokers))) {
+            Config config = admin.describeConfigs(List.of(resource)).all().get().get(resource);
+            assertThat(config.get("cleanup.policy").value()).isEqualTo("compact");
+        }
     }
 
     // --- end to end: outbox -> relay -> Kafka -> consumer ---------------------------------------

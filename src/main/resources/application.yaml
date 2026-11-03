@@ -4,11 +4,15 @@ spring:
     name: sample-service
 
   datasource:
+    # Same environment variables as the MSD services and the Outbox-Service, so one env block
+    # configures both containers. The defaults match the ddd-demo stack.
     # One PostgreSQL instance for everyone, but one schema per service:
     # currentSchema puts this service's tables in "sample_service" only.
-    url: jdbc:postgresql://localhost:5432/${POSTGRES_DB:ddd_demo}?currentSchema=sample_service
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_TABLE:ddd_demo}?currentSchema=sample_service&reWriteBatchedInserts=true
     username: ${POSTGRES_USER:postgres}
-    password: ${POSTGRES_PASSWORD:1q2w3e4r!@}
+    password: ${POSTGRES_PASS:1q2w3e4r!@}
+    hikari:
+      auto-commit: false   # as in the MSD services: every write runs in an explicit transaction anyway
 
   flyway:
     schemas: sample_service
@@ -23,7 +27,7 @@ spring:
     open-in-view: false
 
   kafka:
-    bootstrap-servers: localhost:9092
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.apache.kafka.common.serialization.ByteArraySerializer   # payloads are bytes
@@ -41,9 +45,12 @@ server:
 
 sample:
   topics:
-    # Naming follows the Microservice Dungeon pattern bl.<entity>.events.v<n> ("bl" = business events).
+    # Topics this service PUBLISHES. Naming as in the Microservice Dungeon services:
+    #   bl.<aggregate>.events.v<n>  business events ("what happened"), e.g. bl.game.events.v1
+    #   db.<aggregate>.ecst.v<n>    current state of each aggregate, log-compacted, e.g. db.game.ecst.v1
     # Whether our course adopts this convention is still open (ADR).
     reservation-events: bl.reservation.events.v1
+    reservation-ecst: db.reservation.ecst.v1
     partitions: 3
   local-relay:
     # Stand-in for the Outbox-Service. Off by default; switch on with the "local-relay" profile
@@ -56,3 +63,11 @@ sample:
 outbox:
   topics:
     - name: ${sample.topics.reservation-events}
+    - name: ${sample.topics.reservation-ecst}
+
+# Topics this service CONSUMES, one entry per context it listens to (pattern from the robot-service).
+# Written out instead of referring to sample.topics: a real consumer only knows the producer's AsyncAPI.
+consumer:
+  listener:
+    reservation:
+      topic: bl.reservation.events.v1

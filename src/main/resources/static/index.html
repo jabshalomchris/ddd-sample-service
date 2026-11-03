@@ -123,12 +123,12 @@
   <section>
     <div class="step">2 · Outbox → Kafka</div>
     <h2>Outbox <span class="count" id="waitingCount"></span></h2>
-    <p class="what">Events waiting to be sent. The Outbox-Service sends them to Kafka, keyed by reservation ID, and deletes each row once Kafka has confirmed it.</p>
+    <p class="what">Events waiting to be sent. Each change writes a business event plus a <i>state-transfer</i> with the full current state. The Outbox-Service sends them to Kafka, keyed by reservation ID, and deletes each row once Kafka has confirmed it.</p>
     <table>
       <thead><tr><th>Seq</th><th>Event</th><th>Part.</th><th>Status</th></tr></thead>
       <tbody id="outbox"></tbody>
     </table>
-    <div class="flow">Sent messages: Kafka UI, localhost:8090 → bl.reservation.events.v1</div>
+    <div class="flow">Sent messages: Kafka UI, localhost:8090 → bl.reservation.events.v1 (events) and db.reservation.ecst.v1 (state)</div>
   </section>
 
   <section>

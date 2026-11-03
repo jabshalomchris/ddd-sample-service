@@ -1,7 +1,7 @@
 asyncapi: 3.1.0
 info:
   title: sample-service event API
-  version: 0.2.0
+  version: 0.3.0
   description: |
     Events published by the sample service. Every bounded context documents the
     events it publishes in a file like this one; consumers write their own DTOs
@@ -9,6 +9,11 @@ info:
 
     Records are produced by the supervisors' outbox library and Outbox-Service, so
     they carry the Microservice Dungeon standard headers (see EventHeaders).
+
+    Like the MSD services (e.g. game-service), every change is published twice:
+    a business event on bl.reservation.events.v1 and the reservation's full current
+    state on the log-compacted db.reservation.ecst.v1. Message names are the
+    event_type header values; the version is in event_type_version and the title.
     Delivery is at least once and in order per partition. Consumers must handle
     duplicates (same event_id) and late events (revision not newer than the last
     one they saw).
@@ -27,23 +32,41 @@ channels:
       reservationId, so all events of one reservation are on one partition
       and arrive in the order they happened. Payloads are UTF-8 JSON.
     messages:
-      ReservationConfirmed:
-        $ref: '#/components/messages/ReservationConfirmed'
-      ReservationPartySizeChanged:
-        $ref: '#/components/messages/ReservationPartySizeChanged'
-      ReservationCancelled:
-        $ref: '#/components/messages/ReservationCancelled'
+      reservation.confirmed:
+        $ref: '#/components/messages/reservation.confirmed'
+      reservation.party-size-changed:
+        $ref: '#/components/messages/reservation.party-size-changed'
+      reservation.cancelled:
+        $ref: '#/components/messages/reservation.cancelled'
+
+  reservationEcst:
+    address: db.reservation.ecst.v1
+    description: |
+      Log-compacted topic with the current state of every reservation, published after
+      every change. Key = reservationId, so Kafka eventually keeps only the newest state
+      per reservation. Read this if you only need "what does reservation X look like now";
+      ignore a state whose revision is not newer than the one you have.
+    messages:
+      reservation.state-transfer:
+        $ref: '#/components/messages/reservation.state-transfer'
 
 operations:
   publishReservationEvents:
     action: send
     channel:
       $ref: '#/channels/reservationEvents'
+  publishReservationState:
+    action: send
+    channel:
+      $ref: '#/channels/reservationEcst'
 
 components:
   messages:
-    ReservationConfirmed:
+    reservation.confirmed:
+      name: reservation.confirmed
+      title: Reservation Confirmed V1
       summary: "A guest's reservation was accepted. event_type: reservation.confirmed, version 1"
+      contentType: application/json
       headers:
         $ref: '#/components/schemas/EventHeaders'
       payload:
@@ -57,8 +80,11 @@ components:
           revision: { $ref: '#/components/schemas/Revision' }
           occurredAt: { type: string, format: date-time }
 
-    ReservationPartySizeChanged:
+    reservation.party-size-changed:
+      name: reservation.party-size-changed
+      title: Party Size Changed V1
       summary: "The number of guests changed. event_type: reservation.party-size-changed, version 1"
+      contentType: application/json
       headers:
         $ref: '#/components/schemas/EventHeaders'
       payload:
@@ -70,8 +96,11 @@ components:
           revision: { $ref: '#/components/schemas/Revision' }
           occurredAt: { type: string, format: date-time }
 
-    ReservationCancelled:
+    reservation.cancelled:
+      name: reservation.cancelled
+      title: Reservation Cancelled V1
       summary: "A reservation was cancelled; no further events follow. event_type: reservation.cancelled, version 1"
+      contentType: application/json
       headers:
         $ref: '#/components/schemas/EventHeaders'
       payload:
@@ -82,6 +111,24 @@ components:
           reason: { type: string }
           revision: { $ref: '#/components/schemas/Revision' }
           occurredAt: { type: string, format: date-time }
+
+    reservation.state-transfer:
+      name: reservation.state-transfer
+      title: Reservation ECST V1
+      summary: "The full current state of one reservation. event_type: reservation.state-transfer, version 1"
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/EventHeaders'
+      payload:
+        type: object
+        required: [reservationId, guestName, partySize, reservedFor, status, revision]
+        properties:
+          reservationId: { type: string, format: uuid }
+          guestName: { type: string }
+          partySize: { type: integer, minimum: 1, maximum: 12 }
+          reservedFor: { type: string, format: date-time }
+          status: { type: string, enum: [CONFIRMED, CANCELLED] }
+          revision: { $ref: '#/components/schemas/Revision' }
 
   schemas:
     EventHeaders:
@@ -107,7 +154,7 @@ components:
           description: 8 bytes, big-endian, UTC epoch milliseconds.
         event_type:
           type: string
-          description: Lowercase name without version, e.g. reservation.cancelled.
+          description: Lowercase name without version, e.g. reservation.cancelled. Equals the message name above.
         event_type_version:
           type: integer
           format: int32

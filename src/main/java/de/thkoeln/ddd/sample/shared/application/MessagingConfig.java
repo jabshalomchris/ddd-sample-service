@@ -37,6 +37,17 @@ public class MessagingConfig {
     }
 
     /**
+     * Current state per reservation. Log-compacted ({@code cleanup.policy=compact}): Kafka keeps
+     * at least the newest record per key, so a new consumer can rebuild the state of every
+     * reservation without replaying its whole history. Same partition count as the events topic.
+     */
+    @Bean
+    NewTopic reservationEcstTopic(@Value("${sample.topics.reservation-ecst}") String name,
+                                  @Value("${sample.topics.partitions:3}") int partitions) {
+        return TopicBuilder.name(name).partitions(partitions).replicas(1).compact().build();
+    }
+
+    /**
      * A listener that keeps failing is retried twice, one second apart. After that the
      * record goes to "&lt;topic&gt;.DLT" so it does not block the partition forever.
      */
