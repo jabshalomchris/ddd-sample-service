@@ -3,7 +3,7 @@
 > **Draft 4, 03.11.2026.** Architecture team, workstream 2 (helper libraries: usage guide, sample service, outbox).
 > Lead: Judah. Newcomer read: Dongxin. ADR on outbox and library use: Eldar.
 > Now built on the supervisors' libraries: **outbox-lib-jpa 10.0.1**, **consumer-lib 1.0.0** and the **Outbox-Service 4.1.0** ([Microservice Dungeon](https://gitlab.com/microservice-dungeon/services), Daniel Köllgen).
-> Conventions checked against how the MSD services use the libraries (game-service, robot-service; section 8).
+> Conventions checked against how the MSD services use the libraries (game-service, robot-service, local-dev-env; section 8) and against Daniel Köllgen's answers of 03.11.2026.
 
 This is a reference for every bounded context team. It shows, in a small running service, how to publish domain events reliably with the outbox library and how to consume them safely with the consumer library, on our stack (Kafka and PostgreSQL from the `ddd-demo` docker-compose).
 
@@ -11,9 +11,9 @@ This is a reference for every bounded context team. It shows, in a small running
 
 ## 1. Run it
 
-You need Java 21, Docker, and access to the libraries' GitLab package registry (declared in `pom.xml`).
+You need Java 21 and Docker. The libraries' Maven packages and the Outbox-Service image are **public** on gitlab.com; Maven finds them through the registries declared in `pom.xml`, no token needed.
 
-If Maven cannot download the libraries (the registry may need a token), build them from source once; Maven then finds them locally:
+Only if a download fails anyway (network, proxy), build the libraries from source once; Maven then finds them locally:
 
 ```bash
 git clone https://gitlab.com/microservice-dungeon/services/outbox-lib.git
@@ -109,10 +109,10 @@ The point of the outbox: the state change and the event are written **in the sam
 1. **Registry and dependency.** Add the GitLab registry and `de.microservice-dungeon:outbox-lib-jpa` to `pom.xml` (see this repository's `pom.xml`). Use `outbox-lib-jpa`, never `outbox-lib-direct` for anything but quick experiments: direct mode **loses events** on any failure.
 2. **Let Spring find the library's entity.** On the application class, list both your package and the library's: `@EnableJpaRepositories({"<your.package>", "de.microservicedungeon"})` and the same for `@EntityScan` (`SampleServiceApplication`).
 3. **Create the outbox table yourself.** The library does not. Copy its script into a Flyway migration (`V2__use_outbox_lib.sql`). It lands in your service's own schema.
-4. **Configure your topics.** List every topic you write to under `outbox.topics` (`application.yaml`). The library checks at startup that each one **exists in Kafka** and reads its partition count, so the topic must exist before the service starts. Here the service creates both itself (`MessagingConfig`); the ECST topic is created log-compacted.
+4. **Configure your topics.** List every topic you write to under `outbox.topics` (`application.yaml`). The library checks at startup that each one **exists in Kafka** and reads its partition count, so the topic must exist before the service starts. It needs the count because **the library picks the partition itself, when it writes to the outbox** (from the key), not Kafka when the event is sent. Here the service creates both topics itself (`MessagingConfig`, the ECST topic log-compacted); MSD creates all topics centrally instead (a one-time `kafka-init` container).
 5. **Set `spring.jpa.hibernate.ddl-auto: none`.** With `validate`, the service does not start: the library's table uses `SMALLINT` columns that its entity maps as `Integer`. The library, the Outbox-Service and the MSD services all use `none`.
    The MSD services also set `spring.datasource.hikari.auto-commit: false`, `spring.jpa.open-in-view: false` and `reWriteBatchedInserts=true` in the JDBC URL. The sample does the same.
-6. **Run one Outbox-Service for your service**, pointed at your schema and your topics (`docker-compose.outbox-service.yaml`).
+6. **Run one Outbox-Service per database**, pointed at your schema and your topics (`docker-compose.outbox-service.yaml`). Its topic and partition list must match your `outbox.topics` and the partition counts in Kafka: it reads only the partitions it is told to. Image: `registry.gitlab.com/microservice-dungeon/services/outbox-service:4.1` (or `latest`). Partitions are given as a list, e.g. `APP_OUTBOX_TOPICS_0_PARTITIONS: "0,1,2"`, as in MSD's [local-dev-env](https://gitlab.com/microservice-dungeon/infrastructure/deployments/local-dev-env/-/tree/master/services).
 
 ### Rules
 
@@ -154,7 +154,7 @@ Note that the library's README example uses `KafkaDefaultHeaders`; the class is 
 
 ### Rules
 
-1. **Skip duplicates by `event_id`, yourself.** Consumer-lib 1.0.0 reads the headers and picks the handler, but it does **not** detect duplicates yet. The sample does it in a base class (`IdempotentEventSpecification`): the `event_id` goes into a `processed_event` table in the same transaction as your own writes. If your handler fails, the mark rolls back too, and the redelivered event is handled again.
+1. **Skip duplicates by `event_id`, yourself.** Consumer-lib 1.0.0 reads the headers and picks the handler, but it does **not** detect duplicates or handle errors yet. Daniel Köllgen confirmed (03.11.2026) that the library is minimal and both are still work in progress, so plan without them. The sample does it in a base class (`IdempotentEventSpecification`): the `event_id` goes into a `processed_event` table in the same transaction as your own writes. If your handler fails, the mark rolls back too, and the redelivered event is handled again.
 2. **Do not filter duplicates by a `sequence_id` high-watermark alone.** The library's docs and game-service's AsyncAPI suggest it, but the id is assigned when an event is *written*, not when it *commits*. Two transactions on different entities in the same partition can commit in the opposite order, and the Outbox-Service then publishes the lower id after the higher one. A watermark would silently drop that event; the `event_id` check never does.
 3. **Skip late events by revision.** Keep the last revision you applied per aggregate and ignore anything not newer (`ReservationView`).
 4. **Write your own DTOs from the producer's AsyncAPI file.** Never import another context's classes. Ignore fields you do not need (`@JsonIgnoreProperties(ignoreUnknown = true)`). Event types without a handler are skipped by the library, so producers can add new events without breaking you.
@@ -200,11 +200,11 @@ The packages follow the course's DDD package convention (one top-level package p
 
 `ScheduledRelayTest` runs the walkthrough from section 1 over real HTTP with the relay on its schedule. `ReservationTest` covers the aggregate's own invariants.
 
-The setup was also run end to end with the **real Outbox-Service 4.1.0** (from source, against the same embedded database and broker): events were published and consumed; stopped, it left new events waiting in the outbox; restarted, it sent them by itself.
+The setup was also run end to end with the **real Outbox-Service 4.1.0** (from source, against the same embedded database and broker, configured exactly like `docker-compose.outbox-service.yaml` with both topics): events were published and consumed; stopped, it left new events waiting in the outbox; restarted, it sent them by itself.
 
 ## 8. Compared with the Microservice Dungeon services
 
-The libraries come from the Microservice Dungeon (MSD). Its services use them in production-like code, so this sample follows their conventions. What we compared so far: build files, configuration, migrations and AsyncAPI of **game-service 2.3.0** (producer only) and **robot-service 0.2.4** (producer and consumer). Their Java listener and event classes are still to be read.
+The libraries come from the Microservice Dungeon (MSD). Its services use them in production-like code, so this sample follows their conventions. Compared: build files, configuration, migrations and AsyncAPI of **game-service 2.3.0** (producer only) and **robot-service 0.2.4** (producer and consumer), robot-service's consumer classes (`GameEventListener`, `PlayerJoinedEventV1`, `GameStateTransferEventV1`), and the compose files of MSD's **local-dev-env**.
 
 | Topic | MSD services | This sample |
 |---|---|---|
@@ -217,19 +217,28 @@ The libraries come from the Microservice Dungeon (MSD). Its services use them in
 | Outbox table | own migration with the library's script | same |
 | Library versions | outbox-lib **8.0.0** (single artifact), consumer-lib **0.3.2**, Spring Boot 3.5 | outbox-lib-jpa **10.0.1**, consumer-lib **1.0.0**, Spring Boot 4.1 |
 | Where domain data lives | game-service: PostgreSQL; robot-service: **Redis** (PostgreSQL only for the outbox) | PostgreSQL |
+| Database separation | **one database and user per service** (`POSTGRES_TABLE: game`, user `game`) | one schema per service in a shared database |
+| Topic creation | central, one-time `kafka-init` container; services do not create topics | the service creates its own (`MessagingConfig`) |
+| Partitions | 32 per topic | 3 per topic |
+| Outbox-Service | one container per service (`outbox-game-0`, …), image `:latest`, partitions as `"0,1,…,31"` | one container, image `:4.1`, partitions `"0,1,2"` |
+| Listener | one `@KafkaListener` and one `ProcessorChain` per topic (ECST chain, event chain), built in `@PostConstruct` | one listener, one chain (we consume one topic) |
+| Payload handling | DTO record inside the `EventSpecification`, checked with Bean Validation; error messages name `event_id`, topic, partition, offset | DTO records per event, Jackson only |
+| Duplicates | no `event_id` check: handlers are idempotent by business logic (`createParticipantIfNotExists`); ECST simply overwrites the stored state | `event_id` in `processed_event`, plus revision check |
 
 What this means for the teams:
 
 - **Do not copy MSD code 1:1.** The library versions differ (module names, consumer-lib API). Use this sample for the code and MSD for the conventions.
 - **Every context can publish two kinds of topics.** Business events for "something happened, react to it" and an ECST topic for "keep a copy of my data". Which ones a context offers is part of its published API.
-- **Duplicate detection:** game-service's AsyncAPI tells consumers they may filter duplicates by `sequence_id`. We still recommend `event_id` (section 5, rule 2) and will ask Daniel Köllgen whether the Outbox-Service rules out the commit-order case.
+- **Duplicates: two valid styles.** Robot-service makes every handler idempotent by its business logic ("create if not exists", "overwrite with the newest state"). That works when the handler's effect allows it. Counting, appending or sending notifications do not, and there the `event_id` table of this sample is needed. Neither MSD consumer filters by `sequence_id`, although game-service's AsyncAPI suggests it (section 5, rule 2).
+- **ECST consumers just overwrite.** That is enough with one partition per key and in-order delivery. Our `revision` in the state payload additionally protects against a late redelivery.
+- **Validate payloads and log where a bad record came from** (event ID, topic, partition, offset), as robot-service does. A record that fails ends in the dead-letter topic; these details make it findable.
 
 ## 9. Findings, weak points and open questions
 
 Findings from reading and testing the libraries (outbox-lib 10.0.1, consumer-lib 1.0.0, Outbox-Service 4.1.0):
 
 - `ddl-auto: validate` fails with the library's table (`SMALLINT` vs `Integer`). Use `none`.
-- consumer-lib 1.0.0 does not detect duplicates or manage transactions, although its README mentions both.
+- consumer-lib 1.0.0 does not detect duplicates or handle errors, although its README mentions both. Confirmed as work in progress by Daniel Köllgen (03.11.2026).
 - The libraries state PostgreSQL 17. Our stack runs 18; all tests and the end-to-end run passed on 18.
 - The outbox-lib README still shows version 10.0.0; the repository is at 10.0.1.
 
@@ -240,11 +249,11 @@ Weak points of this sample:
 
 Open questions (team and supervisors):
 
-1. Outbox-Service image name and tag, and whether the GitLab registries are public or need a token.
-2. One Outbox-Service per service in the shared stack: who adds them to the ddd-demo compose? (Hyokyung, infrastructure ADR.)
+1. ~~Outbox-Service image and registry access.~~ Answered 03.11.2026: everything is public; image `outbox-service:4.1` or `latest`.
+2. One Outbox-Service per service database in the shared stack: who adds them to the ddd-demo compose? (Hyokyung, infrastructure ADR.) MSD's local-dev-env has one `*-outbox.yaml` per service to copy from.
 3. Topic and event type naming: adopt the MSD convention for the course (`bl.<aggregate>.events.v1`, `db.<aggregate>.ecst.v1`, `<aggregate>.<event>`)? Should every context publish an ECST topic?
-4. Who creates topics: each service on startup (as here) or centrally?
-5. One schema per service in the shared database (this sample), or one database per service? (Eldar's ADR.)
-6. Number of partitions per topic (here 3).
+4. Who creates topics: each service on startup (as here) or centrally, like MSD's `kafka-init`?
+5. One schema per service in the shared database (this sample), or one database and user per service, like MSD? (Eldar's ADR.)
+6. Number of partitions per topic (here 3, MSD 32).
 7. Does this match the tactical team's starter platform (package structure, build, guardrails)?
-8. For Daniel Köllgen: is a `sequence_id` watermark safe with the Outbox-Service (section 5, rule 2), and do the MSD consumers rely on it?
+8. Duplicates: recommend the `event_id` table to every team, or idempotent handlers like robot-service, with the table only where the effect is not naturally idempotent?
