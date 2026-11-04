@@ -4,6 +4,8 @@ This is a reference for every bounded context team. It shows, in a small running
 
 `Reservation` is **only an example**. It is not one of our bounded contexts and makes no modelling decision for anyone. Look at the mechanics, not the model.
 
+**Overview:** [how an event travels from one service to another](docs/outbox-flow.svg) (also as [PNG](docs/outbox-flow.png) for slides and Miro).
+
 ## 1. Run it
 
 You need Java 21 and Docker. The libraries' Maven packages and the Outbox-Service image are **public** on gitlab.com; Maven finds them through the registries declared in `pom.xml`, no token needed.
