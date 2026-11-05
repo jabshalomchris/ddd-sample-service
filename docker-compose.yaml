@@ -1,0 +1,80 @@
+# The sample service and its Outbox-Service, on top of the shared infrastructure.
+#
+#   1. in the ddd-demo repository:   docker compose up -d          (Kafka, Kafka UI, PostgreSQL)
+#   2. in this repository:           docker compose up -d --build
+#
+#   Demo page:       http://localhost:8080
+#   Kafka UI:        http://localhost:8090      (from the ddd-demo stack)
+#   Outbox-Service:  http://localhost:8081/actuator/health
+#   Stop:            docker compose down
+#
+# Both containers join the ddd-demo stack's network and reach Kafka and PostgreSQL by name
+# (kafka:29092, postgres:5432). Docker names that network after the folder the ddd-demo stack runs in;
+# if yours is not "ddd-demo", set DDD_NETWORK, e.g.  set DDD_NETWORK=myfolder_default
+#
+# This is the pattern for every service: its own container plus its own Outbox-Service, on the
+# shared network. To run the service from your IDE instead, start only the Outbox-Service:
+#   docker compose up -d --no-deps sample-outbox-service
+
+name: ddd-sample-service
+
+services:
+  # The sample service. Creates its tables (schema sample_service) and its two topics on startup.
+  sample-service:
+    build: .
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_TABLE: ${POSTGRES_DB:-ddd_demo}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASS: ${POSTGRES_PASSWORD:-1q2w3e4r!@}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    ports:
+      - "127.0.0.1:8080:8080"
+    # The infrastructure is another stack, so depends_on cannot wait for it: retry until it is up.
+    restart: on-failure
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/8080'"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    networks:
+      - infrastructure
+
+  # Reads the sample service's outbox table and sends the events to Kafka. One per service database.
+  # Stop and start this container to see events wait in the outbox and go out afterwards.
+  sample-outbox-service:
+    image: registry.gitlab.com/microservice-dungeon/services/outbox-service:4.1
+    environment:
+      # The JDBC URL is set directly, so the schema can be chosen (one schema per service).
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://postgres:5432/${POSTGRES_DB:-ddd_demo}?currentSchema=sample_service&reWriteBatchedInserts=true"
+      # Still required by the Outbox-Service's own configuration placeholders:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_TABLE: ${POSTGRES_DB:-ddd_demo}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASS: ${POSTGRES_PASSWORD:-1q2w3e4r!@}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      APP_SCHEDULER_INTERVAL: "500"              # polling interval in ms
+      # Topics and partitions this instance reads: the same list as outbox.topics in the
+      # service's application.yaml, with every partition of each topic.
+      APP_OUTBOX_TOPICS_0_NAME: bl.reservation.events.v1
+      APP_OUTBOX_TOPICS_0_PARTITIONS: "0,1,2"
+      APP_OUTBOX_TOPICS_1_NAME: db.reservation.ecst.v1
+      APP_OUTBOX_TOPICS_1_PARTITIONS: "0,1,2"
+    ports:
+      - "127.0.0.1:8081:8080"
+    restart: on-failure
+    # Waits for the sample service, so its outbox table and topics exist.
+    # When started alone (service running in the IDE), use: docker compose up -d --no-deps sample-outbox-service
+    depends_on:
+      sample-service:
+        condition: service_healthy
+    networks:
+      - infrastructure
+
+networks:
+  infrastructure:
+    external: true
+    name: ${DDD_NETWORK:-ddd-demo_default}

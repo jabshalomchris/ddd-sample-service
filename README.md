@@ -19,22 +19,32 @@ cd outbox-lib   && ./mvnw install -DskipTests && cd ..   # their tests need Dock
 cd consumer-lib && ./mvnw install -DskipTests && cd ..
 ```
 
+First start the shared infrastructure, then the service on top of it:
+
 ```bash
-# in the ddd-demo repository: Kafka on localhost:9092, Kafka UI on localhost:8090, PostgreSQL on localhost:5432
+# 1. in the ddd-demo repository: Kafka on localhost:9092, Kafka UI on localhost:8090, PostgreSQL on localhost:5432
 docker compose up -d
 ```
 
 The service only *writes* events into its outbox table. Something has to *send* them to Kafka. Pick one:
 
-**A. With the Outbox-Service (the real setup)**
+**A. Service and Outbox-Service in Docker (the real setup, also for the demo)**
 
 ```bash
-# in this repository
-docker compose -f docker-compose.outbox-service.yaml up -d
+# 2. in this repository: builds the service and starts it with its own Outbox-Service
+docker compose up -d --build
+```
+
+Both containers join the ddd-demo network and reach `kafka:29092` and `postgres:5432` by name. Docker names that network after the folder the ddd-demo stack runs in; if it is not `ddd-demo`, set `DDD_NETWORK` (for example `myfolder_default`). Stop with `docker compose down`.
+
+**A2. Service in your IDE, Outbox-Service in Docker (while working on the code)**
+
+```bash
+docker compose up -d --no-deps sample-outbox-service
 ./mvnw spring-boot:run                     # Windows: .\mvnw.cmd spring-boot:run
 ```
 
-**B. Without it (local development, demo fallback)**
+**B. Without the Outbox-Service (local development, demo fallback)**
 
 ```bash
 ./mvnw spring-boot:run -Dspring-boot.run.profiles=local-relay
@@ -109,7 +119,7 @@ The point of the outbox: the state change and the event are written **in the sam
 4. **Configure your topics.** List every topic you write to under `outbox.topics` (`application.yaml`). The library checks at startup that each one **exists in Kafka** and reads its partition count, so the topic must exist before the service starts. It needs the count because **the library picks the partition itself, when it writes to the outbox** (from the key), not Kafka when the event is sent. Here the service creates both topics itself (`MessagingConfig`, the ECST topic log-compacted); MSD creates all topics centrally instead (a one-time `kafka-init` container).
 5. **Set `spring.jpa.hibernate.ddl-auto: none`.** With `validate`, the service does not start: the library's table uses `SMALLINT` columns that its entity maps as `Integer`. The library, the Outbox-Service and the MSD services all use `none`.
    The MSD services also set `spring.datasource.hikari.auto-commit: false`, `spring.jpa.open-in-view: false` and `reWriteBatchedInserts=true` in the JDBC URL. The sample does the same.
-6. **Run one Outbox-Service per database**, pointed at your schema and your topics (`docker-compose.outbox-service.yaml`). Its topic and partition list must match your `outbox.topics` and the partition counts in Kafka: it reads only the partitions it is told to. Image: `registry.gitlab.com/microservice-dungeon/services/outbox-service:4.1` (or `latest`). Partitions are given as a list, e.g. `APP_OUTBOX_TOPICS_0_PARTITIONS: "0,1,2"`, as in MSD's [local-dev-env](https://gitlab.com/microservice-dungeon/infrastructure/deployments/local-dev-env/-/tree/master/services).
+6. **Run one Outbox-Service per database**, pointed at your schema and your topics (`docker-compose.yaml`, service `sample-outbox-service`). Its topic and partition list must match your `outbox.topics` and the partition counts in Kafka: it reads only the partitions it is told to. Image: `registry.gitlab.com/microservice-dungeon/services/outbox-service:4.1` (or `latest`). Partitions are given as a list, e.g. `APP_OUTBOX_TOPICS_0_PARTITIONS: "0,1,2"`, as in MSD's [local-dev-env](https://gitlab.com/microservice-dungeon/infrastructure/deployments/local-dev-env/-/tree/master/services).
 
 ### Rules
 
@@ -170,7 +180,7 @@ Note that the library's README example uses `KafkaDefaultHeaders`; the class is 
 | `inbox/*` (`IdempotencyGuard`, `IdempotentEventSpecification`) | Copy as they are |
 | `ReservationEventHandlers`, `ReservationEventListener` | Pattern for every event you consume |
 | `shared/application/MessagingConfig` | Copy; rename the topics (keep `.compact()` on the ECST topic) |
-| `docker-compose.outbox-service.yaml` | Template for your service's Outbox-Service |
+| `docker-compose.yaml`, `Dockerfile` | Template: your service and its Outbox-Service as containers on the shared network |
 | `docs/asyncapi.yaml` | Template for your own event API |
 | `localrelay/*` | Only if you have no Outbox-Service locally. Remove it once you do. |
 | `demo/*`, `static/index.html`, `DemoPageRunner` | Do not copy. For your own dummy client, build on your service's real API |
@@ -197,4 +207,4 @@ The packages follow the course's DDD package convention (one top-level package p
 
 `ScheduledRelayTest` runs the walkthrough from section 1 over real HTTP with the relay on its schedule. `ReservationTest` covers the aggregate's own invariants.
 
-The setup was also run end to end with the **real Outbox-Service 4.1.0** (from source, against the same embedded database and broker, configured exactly like `docker-compose.outbox-service.yaml` with both topics): events were published and consumed; stopped, it left new events waiting in the outbox; restarted, it sent them by itself.
+The setup was also run end to end with the **real Outbox-Service 4.1.0** (from source, against the same embedded database and broker, configured exactly like the `sample-outbox-service` in `docker-compose.yaml`, with both topics): events were published and consumed; stopped, it left new events waiting in the outbox; restarted, it sent them by itself.
